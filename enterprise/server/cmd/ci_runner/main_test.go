@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -180,6 +181,78 @@ func TestGitFetchRetriesSlowTransfer(t *testing.T) {
 	fetchedCommitSHA, gitErr := git(t.Context(), io.Discard, "rev-parse", "FETCH_HEAD")
 	require.Nil(t, gitErr)
 	require.Equal(t, wantCommitSHA, strings.TrimSpace(fetchedCommitSHA))
+}
+
+// newTestInvocationLog returns a log whose destinations can be asserted apart:
+// streamed is what the client streams, stderr what only the action's stderr keeps.
+func newTestInvocationLog(t *testing.T) (log *invocationLog, streamed, stderr *bytes.Buffer) {
+	t.Helper()
+	streamed = &bytes.Buffer{}
+	stderr = &bytes.Buffer{}
+	log = newInvocationLog([]string{"SECRET_VALUE"})
+	log.stderrWriter = stderr
+	log.writer = io.MultiWriter(streamed, stderr)
+	return log, streamed, stderr
+}
+
+func TestQuiet(t *testing.T) {
+	t.Run("keeps the runner's narration out of the invocation log", func(t *testing.T) {
+		flags.Set(t, "quiet", true)
+		log, streamed, stderr := newTestInvocationLog(t)
+
+		writeCommandSummary(log, "Syncing existing repo...")
+		_, gitErr := git(t.Context(), log, "version")
+
+		require.Nil(t, gitErr)
+		require.Empty(t, streamed.String())
+		require.Contains(t, stderr.String(), "Syncing existing repo...")
+		require.Contains(t, stderr.String(), "git version")
+	})
+
+	t.Run("keeps the output of a requested command in the invocation log", func(t *testing.T) {
+		flags.Set(t, "quiet", true)
+		log, streamed, _ := newTestInvocationLog(t)
+		reporter := &buildEventReporter{log: log}
+
+		require.NoError(t, runBashCommand(t.Context(), "echo hello", nil, "" /*=dir*/, reporter))
+
+		// The command line the runner echoes is narration, so only the
+		// command's own output reaches the log.
+		require.Equal(t, "hello", strings.TrimSpace(streamed.String()))
+	})
+
+	t.Run("writes the runner's narration to the invocation log otherwise", func(t *testing.T) {
+		log, streamed, _ := newTestInvocationLog(t)
+
+		writeCommandSummary(log, "Syncing existing repo...")
+
+		require.Contains(t, streamed.String(), "Syncing existing repo...")
+	})
+
+	t.Run("does not redirect a sink the caller chose", func(t *testing.T) {
+		flags.Set(t, "quiet", true)
+		var callerSink bytes.Buffer
+
+		// The runner passes io.Discard for git commands whose arguments can
+		// carry the repo access token, so quiet mode must not route around the
+		// sink the caller picked.
+		_, gitErr := git(t.Context(), &callerSink, "version")
+
+		require.Nil(t, gitErr)
+		require.Contains(t, callerSink.String(), "git version")
+	})
+
+	t.Run("redacts secrets on both paths", func(t *testing.T) {
+		for _, quietMode := range []bool{true, false} {
+			flags.Set(t, "quiet", quietMode)
+			log, streamed, stderr := newTestInvocationLog(t)
+
+			writeCommandSummary(log, "the token is SECRET_VALUE")
+
+			require.NotContains(t, streamed.String(), "SECRET_VALUE")
+			require.NotContains(t, stderr.String(), "SECRET_VALUE")
+		}
+	})
 }
 
 func TestIsTransferTooSlow(t *testing.T) {

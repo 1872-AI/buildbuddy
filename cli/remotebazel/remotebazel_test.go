@@ -571,6 +571,60 @@ func TestPrintLogs_ReturnsStreamError(t *testing.T) {
 	require.Equal(t, "Analyzing: 1\n", out)
 }
 
+func TestRunnerFlags_Quiet(t *testing.T) {
+	setQuietForTest(t)
+
+	require.Contains(t, runnerFlags(), "--quiet")
+}
+
+func TestParseRemoteCliFlags_Quiet(t *testing.T) {
+	setQuietForTest(t)
+	for _, tc := range []struct {
+		name           string
+		inputArgs      []string
+		expectedOutput []string
+	}{
+		{
+			name:           "long form",
+			inputArgs:      []string{"--quiet", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			name:           "short form",
+			inputArgs:      []string{"-q", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			name:           "explicit value",
+			inputArgs:      []string{"--quiet=true", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			// A bare boolean flag must not consume the flag that follows it.
+			name:           "startup flag after the short form",
+			inputArgs:      []string{"-q", "--output_base=/tmp/base", "build", "//..."},
+			expectedOutput: []string{"--output_base=/tmp/base", "build", "//..."},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, RemoteFlagset.Set("quiet", "false"))
+
+			actualOutput, err := parseRemoteCliFlags(tc.inputArgs)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedOutput, actualOutput)
+			require.True(t, *quiet)
+		})
+	}
+}
+
+// setQuietForTest restores the process-global flag value after the test.
+func setQuietForTest(t *testing.T) {
+	previous := *quiet
+	*quiet = true
+	t.Cleanup(func() { *quiet = previous })
+}
+
 func TestGitConfig_BranchAndSha(t *testing.T) {
 	// Setup the "remote" repo
 	remoteRepoPath, originalMasterHeadCommit := testgit.MakeTempRepo(t, map[string]string{"hello.txt": "exit 0"})

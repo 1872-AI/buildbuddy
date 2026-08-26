@@ -101,7 +101,12 @@ var (
 	// pass github-related fields.
 	skipAutomaticCheckout = RemoteFlagset.Bool("skip_auto_checkout", false, "Whether to skip the automatic GitHub checkout steps on the remote runner.")
 	invocationIDFile      = RemoteFlagset.String("invocation_id_file", "", "If set, write the remote invocation ID to the file specified here.")
+	quiet                 = RemoteFlagset.Bool("quiet", false, "Print only the output of the command that ran remotely, so the run reads like a local bazel invocation.")
 )
+
+func init() {
+	RemoteFlagset.BoolVar(quiet, "q", false, "Short alias for --quiet.")
+}
 
 func consoleCursorMoveUp(y int) {
 	fmt.Print(escapeSeq + strconv.Itoa(y) + "A")
@@ -534,6 +539,11 @@ func generatePatches(baseCommit string) ([][]byte, error) {
 	go func() {
 		select {
 		case <-time.After(500 * time.Millisecond):
+			// Quiet mode drops this despite being a warning: it reports
+			// slowness, not a problem with the run.
+			if *quiet {
+				return
+			}
 			log.Warnf("Mirroring your local git state is taking a long time." +
 				" See https://www.buildbuddy.io/docs/remote-bazel/#automatic-git-state-mirroring" +
 				" for more details and suggestions.")
@@ -1006,7 +1016,9 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		}
 		relArtifacts = append(relArtifacts, "  "+rp)
 	}
-	if len(relArtifacts) > 0 {
+	// Not log.Printf, so quiet mode has to say so: artifact paths go to stdout,
+	// where a caller can pipe them.
+	if len(relArtifacts) > 0 && !*quiet {
 		fmt.Printf("Downloaded artifacts:\n%s\n", strings.Join(relArtifacts, "\n"))
 	}
 	return downloadedFiles, nil
@@ -1210,11 +1222,7 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 				Run: opts.Command,
 			},
 		},
-		RunnerFlags: []string{fmt.Sprintf("--skip_auto_checkout=%v", *skipAutomaticCheckout)},
-	}
-
-	if *gitFetchDepth >= 0 {
-		req.RunnerFlags = append(req.RunnerFlags, fmt.Sprintf("--git_fetch_depth=%d", *gitFetchDepth))
+		RunnerFlags: runnerFlags(),
 	}
 
 	req.GetRepoState().Patch = append(req.GetRepoState().Patch, repoConfig.Patches...)
@@ -1383,6 +1391,19 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 	return exitCode, nil
 }
 
+// runnerFlags returns the flags for the remote runner itself, not for the bazel
+// command it runs.
+func runnerFlags() []string {
+	flags := []string{fmt.Sprintf("--skip_auto_checkout=%v", *skipAutomaticCheckout)}
+	if *gitFetchDepth >= 0 {
+		flags = append(flags, fmt.Sprintf("--git_fetch_depth=%d", *gitFetchDepth))
+	}
+	if *quiet {
+		flags = append(flags, "--quiet")
+	}
+	return flags
+}
+
 func attemptRun(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, execClient repb.ExecutionClient, req *rnpb.RunRequest) (*inpb.GetInvocationResponse, *repb.ExecuteResponse, error) {
 	var inRsp *inpb.GetInvocationResponse
 	var execRsp *repb.ExecuteResponse
@@ -1514,6 +1535,7 @@ func HandleRemoteBazel(commandLineArgs []string) (int, error) {
 	if err != nil {
 		return 1, status.WrapError(err, "parse cli flags")
 	}
+	log.SetQuiet(*quiet)
 
 	tempDir, err := os.MkdirTemp("", "buildbuddy-cli-*")
 	if err != nil {
@@ -1768,6 +1790,12 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Remove all cli flags from the arg list
 	argsRemoteFlagsRemoved := args[:endParsingIndex]
 	RemoteFlagset.VisitAll(func(f *flag.Flag) {
+		// arg.Pop reads `--name value`, so for a boolean flag it would consume
+		// whatever follows - a bazel startup flag, say.
+		if isBoolFlag(f) {
+			argsRemoteFlagsRemoved = removeBoolFlag(argsRemoteFlagsRemoved, f.Name)
+			return
+		}
 		// Certain flags with slice values can be passed multiple times.
 		// Remove all instances.
 		flagVal := "start"
@@ -1779,6 +1807,27 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Add back in the bazel command and any subsequent flags
 	argsRemoteFlagsRemoved = append(argsRemoteFlagsRemoved, args[endParsingIndex:]...)
 	return argsRemoteFlagsRemoved, nil
+}
+
+func isBoolFlag(f *flag.Flag) bool {
+	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && boolFlag.IsBoolFlag()
+}
+
+// removeBoolFlag removes the named boolean flag in every form the flag package
+// accepts (Ex. `-q`, `--quiet`, `--quiet=true`).
+func removeBoolFlag(args []string, name string) []string {
+	kept := make([]string, 0, len(args))
+	for _, a := range args {
+		unprefixed := strings.TrimPrefix(strings.TrimPrefix(a, "--"), "-")
+		if a != unprefixed {
+			if flagName, _, _ := strings.Cut(unprefixed, "="); flagName == name {
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	return kept
 }
 
 func contains(m map[string]string, elem string) bool {

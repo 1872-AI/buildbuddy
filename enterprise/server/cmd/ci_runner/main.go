@@ -186,6 +186,7 @@ var (
 	visibility         = flag.String("visibility", "", "If set, use the specified value for VISIBILITY build metadata for the workflow invocation.")
 	timeout            = flag.Duration("timeout", 0, "Timeout before all commands will be canceled automatically.")
 	timeoutReason      = flag.String("timeout_reason", "", "Reason for the configured timeout.")
+	quiet              = flag.Bool("quiet", false, "If set, write the runner's own narration to stderr only, so the invocation log holds just what the requested commands printed.")
 
 	// Flags to configure setting up git repo
 	skipAutomaticCheckout = flag.Bool("skip_auto_checkout", false, "Whether to skip the automatic GitHub setup steps on the remote runner.")
@@ -982,6 +983,10 @@ func (r *buildEventReporter) Write(b []byte) (int, error) {
 	return r.log.Write(b)
 }
 
+func (r *buildEventReporter) commandOutput() io.Writer {
+	return r.log.commandOutput()
+}
+
 func (r *buildEventReporter) Println(vals ...interface{}) {
 	r.log.Println(vals...)
 }
@@ -991,24 +996,45 @@ func (r *buildEventReporter) Printf(format string, vals ...interface{}) {
 
 type invocationLog struct {
 	lockingbuffer.LockingBuffer
-	writer          io.Writer
+	writer io.Writer
+	// Where quiet mode sends narration, bypassing the invocation log.
+	stderrWriter    io.Writer
 	writeListener   func(s string)
 	redactionValues []string
 }
 
 func newInvocationLog(redactionValues []string) *invocationLog {
-	invLog := &invocationLog{writeListener: func(s string) {}, redactionValues: redactionValues}
-	invLog.writer = io.MultiWriter(&invLog.LockingBuffer, os.Stderr)
+	invLog := &invocationLog{writeListener: func(s string) {}, redactionValues: redactionValues, stderrWriter: os.Stderr}
+	invLog.writer = io.MultiWriter(&invLog.LockingBuffer, invLog.stderrWriter)
 	return invLog
 }
 
+// Write records the runner's own narration. A requested command's output goes
+// through commandOutput instead.
 func (invLog *invocationLog) Write(b []byte) (int, error) {
+	return invLog.write(b, true /*=isNarration*/)
+}
+
+// commandOutput returns the writer for a requested command's output, which
+// reaches the invocation log even in quiet mode.
+func (invLog *invocationLog) commandOutput() io.Writer {
+	return commandOutputWriter{log: invLog}
+}
+
+func (invLog *invocationLog) write(b []byte, isNarration bool) (int, error) {
 	output := string(b)
 
 	// Use value-aware redaction so user-defined secret values injected into the
 	// runner environment are masked in invocation logs (including overlapping
 	// values handled safely by longest-first replacement in redact package).
 	redacted := redact.RedactTextWithValues(output, invLog.redactionValues)
+
+	// The executor captures the runner's stderr as the action's stderr, so the
+	// record of how the run was set up survives being left out of the log.
+	if isNarration && *quiet {
+		_, err := invLog.stderrWriter.Write([]byte(redacted))
+		return len(b), err
+	}
 
 	invLog.writeListener(redacted)
 	_, err := invLog.writer.Write([]byte(redacted))
@@ -1023,6 +1049,29 @@ func (invLog *invocationLog) Println(vals ...interface{}) {
 }
 func (invLog *invocationLog) Printf(format string, vals ...interface{}) {
 	invLog.Write([]byte(fmt.Sprintf(format+"\n", vals...)))
+}
+
+type commandOutputWriter struct {
+	log *invocationLog
+}
+
+func (w commandOutputWriter) Write(b []byte) (int, error) {
+	return w.log.write(b, false /*=isNarration*/)
+}
+
+// commandOutputSink is a sink that tells a requested command's output apart
+// from narration.
+type commandOutputSink interface {
+	commandOutput() io.Writer
+}
+
+// commandOutput returns sink's writer for a requested command's output, or
+// sink itself if it draws no such distinction.
+func commandOutput(sink io.Writer) io.Writer {
+	if s, ok := sink.(commandOutputSink); ok {
+		return s.commandOutput()
+	}
+	return sink
 }
 
 // actionRunner runs a single action in the BuildBuddy config.
@@ -2765,7 +2814,7 @@ func runBashCommand(ctx context.Context, cmd string, env map[string]string, dir 
 		return err
 	}
 
-	return runCommand(ctx, "bash", []string{"-eo", "pipefail", "-c", cmd}, env, dir, outputSink)
+	return runCommand(ctx, "bash", []string{"-eo", "pipefail", "-c", cmd}, env, dir, commandOutput(outputSink))
 }
 
 func runCommandWithOutput(ctx context.Context, executable string, args []string, env map[string]string, dir string, outputSink io.Writer) (string, *commandError) {
