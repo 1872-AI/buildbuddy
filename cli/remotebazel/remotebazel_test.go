@@ -571,6 +571,168 @@ func TestPrintLogs_ReturnsStreamError(t *testing.T) {
 	require.Equal(t, "Analyzing: 1\n", out)
 }
 
+// A remote runner log, as the event log API serves it: the runner's own lines
+// carry a gray UTC timestamp, and the style carries over between lines, so some
+// of them arrive with the color escape or the timestamp missing.
+const runnerLog = "\x1b[90m2026-08-26 13:41:51.571 UTC \x1b[mSyncing existing repo...\n" +
+	"\x1b[90m2026-08-26 13:41:51.650 UTC \x1b[32m$ \x1b[mgit fetch --force --depth=1 origin 31505b6c\n" +
+	"remote: Enumerating objects: 29, done.\n" +
+	"\x1b[90m2026-08-26 13:41:52.719 UTC \x1b[32m$ \x1b[mgit clean -x -d --force\n" +
+	"Removing bazel-out\n" +
+	"\x1b[90m2026-08-26 13:41:52.777 UTC \x1b[32m$ \x1b[mbazel build //tools/dev_env:go\n" +
+	"(13:41:55) \x1b[32mINFO: \x1b[mAnalyzed target //tools/dev_env:go\n" +
+	"(13:42:04) \x1b[32mINFO: \x1b[mBuild completed successfully, 1347 total actions\n" +
+	"\x1b[90m2026-08-26 13:42:04.463 UTC (command exited with code 0)\n" +
+	"2026-08-26 13:42:04.463 UTC \x1b[mUploading artifacts from /home/buildbuddy/workspace/artifacts\n" +
+	"\x1b[90m2026-08-26 13:42:05.758 UTC \x1b[32m$ \x1b[mgit gc --auto\n" +
+	"\x1b[90mGit maintenance cleaned 0MB \x1b[m\n" +
+	"\nRemote run completed at 2026-08-26 13:42:05.760 UTC\n"
+
+// What is left of runnerLog once the runner's own output is dropped: exactly
+// what the same bazel command prints when it is run locally.
+const runnerLogBazelOutput = "(13:41:55) \x1b[32mINFO: \x1b[mAnalyzed target //tools/dev_env:go\n" +
+	"(13:42:04) \x1b[32mINFO: \x1b[mBuild completed successfully, 1347 total actions\n"
+
+func TestQuietLogFilter(t *testing.T) {
+	t.Run("keeps only the requested command's output", func(t *testing.T) {
+		var filter quietLogFilter
+
+		require.Equal(t, runnerLogBazelOutput, filter.filter(runnerLog))
+		require.Empty(t, filter.flush())
+		require.True(t, filter.sawCommandOutput)
+	})
+
+	t.Run("classifies a line only once it is complete", func(t *testing.T) {
+		var filter quietLogFilter
+
+		// Split every byte of the log into its own call, which puts a split
+		// inside every runner line, command marker and bazel line.
+		var kept strings.Builder
+		for i := 0; i < len(runnerLog); i++ {
+			kept.WriteString(filter.filter(runnerLog[i : i+1]))
+		}
+		kept.WriteString(filter.flush())
+
+		require.Equal(t, runnerLogBazelOutput, kept.String())
+	})
+
+	t.Run("flushes an unterminated last line of command output", func(t *testing.T) {
+		var filter quietLogFilter
+
+		kept := filter.filter("\x1b[90m2026-08-26 13:41:52.777 UTC \x1b[32m$ \x1b[mbazel build //...\nERROR: ")
+
+		require.Empty(t, kept)
+		require.Equal(t, "ERROR: ", filter.flush())
+	})
+
+	t.Run("reports a log with no command output", func(t *testing.T) {
+		var filter quietLogFilter
+
+		kept := filter.filter("\x1b[90m2026-08-26 13:41:51.571 UTC \x1b[mFailed to fetch git repo\n")
+
+		require.Empty(t, kept)
+		require.False(t, filter.sawCommandOutput)
+	})
+}
+
+func TestPrintLogs_QuietKeepsOnlyCommandOutput(t *testing.T) {
+	setQuietForTest(t)
+	half := len(runnerLog) / 2
+	client := &scriptedBuildBuddyClient{
+		script: []scriptedRecv{
+			// Split mid-log, so a chunk boundary lands inside a line.
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer:      []byte(runnerLog[:half]),
+				NextChunkId: "0001",
+			}},
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer: []byte(runnerLog[half:]),
+			}},
+		},
+	}
+
+	out, err := runPrintLogsWithCapturedStdout(t, client)
+
+	require.NoError(t, err)
+	require.Equal(t, runnerLogBazelOutput, out)
+}
+
+func TestStreamLogs_QuietKeepsOnlyCommandOutput(t *testing.T) {
+	setQuietForTest(t)
+	// Longer than the 80-column test terminal, so the runner's command line is
+	// drawn as more than one row. Every row of it should be dropped, not just
+	// the row carrying the timestamp prefix.
+	runnerCommand := "\x1b[90m2026-08-26 13:41:52.777 UTC \x1b[32m$ \x1b[mbazel build //tools/dev_env:go " + strings.Repeat("--config=strict ", 5)
+	client := &scriptedBuildBuddyClient{
+		script: []scriptedRecv{
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer:      []byte(runnerCommand + "\nAnalyzing: 1\n"),
+				NextChunkId: "0001",
+				Live:        true,
+			}},
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer: []byte(runnerCommand + "\nAnalyzing: 2\nDone.\n"),
+			}},
+		},
+	}
+
+	_, rendered := runStreamLogsWithPTY(t, client, nil)
+
+	require.NotContains(t, rendered, "bazel build")
+	require.NotContains(t, rendered, "config=strict")
+	require.Contains(t, rendered, "Analyzing: 2")
+	require.Contains(t, rendered, "Done.")
+}
+
+func TestParseRemoteCliFlags_Quiet(t *testing.T) {
+	setQuietForTest(t)
+	for _, tc := range []struct {
+		name           string
+		inputArgs      []string
+		expectedOutput []string
+	}{
+		{
+			name:           "long form",
+			inputArgs:      []string{"--quiet", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			name:           "short form",
+			inputArgs:      []string{"-q", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			name:           "explicit value",
+			inputArgs:      []string{"--quiet=true", "build", "//..."},
+			expectedOutput: []string{"build", "//..."},
+		},
+		{
+			// A bare boolean flag must not consume the flag that follows it.
+			name:           "startup flag after the short form",
+			inputArgs:      []string{"-q", "--output_base=/tmp/base", "build", "//..."},
+			expectedOutput: []string{"--output_base=/tmp/base", "build", "//..."},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, RemoteFlagset.Set("quiet", "false"))
+
+			actualOutput, err := parseRemoteCliFlags(tc.inputArgs)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedOutput, actualOutput)
+			require.True(t, *quiet)
+		})
+	}
+}
+
+// setQuietForTest enables quiet mode for the duration of the test, restoring
+// the process-global flag value afterwards.
+func setQuietForTest(t *testing.T) {
+	previous := *quiet
+	*quiet = true
+	t.Cleanup(func() { *quiet = previous })
+}
+
 func TestGitConfig_BranchAndSha(t *testing.T) {
 	// Setup the "remote" repo
 	remoteRepoPath, originalMasterHeadCommit := testgit.MakeTempRepo(t, map[string]string{"hello.txt": "exit 0"})

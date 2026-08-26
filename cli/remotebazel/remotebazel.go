@@ -101,7 +101,12 @@ var (
 	// pass github-related fields.
 	skipAutomaticCheckout = RemoteFlagset.Bool("skip_auto_checkout", false, "Whether to skip the automatic GitHub checkout steps on the remote runner.")
 	invocationIDFile      = RemoteFlagset.String("invocation_id_file", "", "If set, write the remote invocation ID to the file specified here.")
+	quiet                 = RemoteFlagset.Bool("quiet", false, "Print only the output of the remote bazel command, suppressing remote runner and CLI progress output, so the run reads like a local bazel invocation.")
 )
+
+func init() {
+	RemoteFlagset.BoolVar(quiet, "q", false, "Short alias for --quiet.")
+}
 
 func consoleCursorMoveUp(y int) {
 	fmt.Print(escapeSeq + strconv.Itoa(y) + "A")
@@ -534,6 +539,9 @@ func generatePatches(baseCommit string) ([][]byte, error) {
 	go func() {
 		select {
 		case <-time.After(500 * time.Millisecond):
+			if *quiet {
+				return
+			}
 			log.Warnf("Mirroring your local git state is taking a long time." +
 				" See https://www.buildbuddy.io/docs/remote-bazel/#automatic-git-state-mirroring" +
 				" for more details and suggestions.")
@@ -746,6 +754,93 @@ func (s *logStream) Recv() (string, *elpb.GetEventLogChunkResponse, error) {
 	return chunkID, l, nil
 }
 
+// Lines in a remote runner log that the runner wrote itself, rather than
+// passing through from a command it ran.
+//
+// The runner prefixes each of them with a gray UTC timestamp, and announces
+// every command it runs with a `$ <command>` line. Styles carry over between
+// lines in the stored log, so a line can arrive with the color escape, the
+// timestamp, or both dropped from its prefix.
+var (
+	runnerLogLinePattern = regexp.MustCompile(`^(?:` + ansiStylePattern + `)?` + runnerTimestampPattern + `|^` + ansiGrayPattern)
+	runnerCommandPattern = regexp.MustCompile(`^(?:` + ansiStylePattern + `)?` + runnerTimestampPattern + `(?:` + ansiStylePattern + `|\s)*\$ (?:` + ansiStylePattern + `|\s)*(.*)$`)
+)
+
+const (
+	ansiGrayPattern        = `\x1b\[90m`
+	ansiStylePattern       = `\x1b\[[0-9;]*m`
+	runnerTimestampPattern = `\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC`
+
+	// The runner prepares the workspace by running git itself. Its output is
+	// not part of what was asked for, so quiet mode drops it along with the
+	// runner's own lines.
+	runnerGitCommandPrefix = "git "
+)
+
+// quietLogFilter keeps only the output of the command the remote runner was
+// asked to run, so a quiet run reads like a local bazel invocation.
+//
+// Bazel's output is passed through the runner untouched, so what is left after
+// dropping the lines the runner wrote itself, and the output of the git
+// commands it ran to prepare the workspace, is the output of the command.
+type quietLogFilter struct {
+	// Whether the lines being read are the output of the requested command.
+	printing bool
+	// Whether any of the requested command's output was recognized, so a log
+	// this filter cannot parse can be reported instead of printing nothing.
+	sawCommandOutput bool
+	// Trailing bytes of an unterminated line, held back because a line can
+	// only be classified once it is complete.
+	pending string
+}
+
+// filter returns the part of buf to print.
+func (f *quietLogFilter) filter(buf string) string {
+	buf = f.pending + buf
+	f.pending = ""
+	var kept strings.Builder
+	for {
+		line, rest, foundNewline := strings.Cut(buf, "\n")
+		if !foundNewline {
+			f.pending = line
+			return kept.String()
+		}
+		if match := runnerCommandPattern.FindStringSubmatch(line); match != nil {
+			f.printing = !strings.HasPrefix(match[1], runnerGitCommandPrefix)
+			f.sawCommandOutput = f.sawCommandOutput || f.printing
+		} else if runnerLogLinePattern.MatchString(line) {
+			// Any other line the runner wrote itself - a progress summary, or
+			// the exit code of the command that just finished - ends the output
+			// of the command before it.
+			f.printing = false
+		} else if f.printing {
+			kept.WriteString(line)
+			kept.WriteString("\n")
+		}
+		buf = rest
+	}
+}
+
+// flush returns the unterminated last line of the log, if it belongs to the
+// command's output.
+func (f *quietLogFilter) flush() string {
+	pending := f.pending
+	f.pending = ""
+	if !f.printing {
+		return ""
+	}
+	return pending
+}
+
+// warnIfNothingKept reports a log this filter could not find any command output
+// in, so an unrecognized log reads as a warning rather than as a silent run.
+func (f *quietLogFilter) warnIfNothingKept() {
+	if f.sawCommandOutput {
+		return
+	}
+	log.Warnf("--quiet: no command output found in the remote runner log. Rerun without --quiet to see the whole log.")
+}
+
 // streamLogs streams the logs with real-time progress updates. It uses ANSI
 // escape sequences to delete and rewrite outdated progress messages
 func streamLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) error {
@@ -767,6 +862,11 @@ func streamLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, inv
 	// Buffer of lines currently printed to the terminal, kept so redraws do
 	// not reprint log lines that are already on screen.
 	var liveLines []string
+	// In quiet mode, the filter state carried into the chunk being drawn, and
+	// the state the last draw left, which the end-of-log flush works from. A
+	// live chunk is redrawn from its start, so the carried state only advances
+	// once a chunk is finalized.
+	var quietCarry, quietLatest quietLogFilter
 
 	drawChunk := func(chunk logChunk) {
 		// Skip empty responses, which the server sends while waiting for log
@@ -775,7 +875,23 @@ func streamLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, inv
 		if len(chunk.response.GetBuffer()) == 0 {
 			return
 		}
-		logLines := splitLogBuffer(chunk.response.GetBuffer())
+		buf := chunk.response.GetBuffer()
+		if *quiet {
+			chunkFilter := quietCarry
+			filtered := chunkFilter.filter(string(buf))
+			if !chunk.response.GetLive() {
+				quietCarry = chunkFilter
+			}
+			quietLatest = chunkFilter
+			buf = []byte(filtered)
+		}
+		// A chunk of nothing but runner output filters down to empty. Draw it
+		// as an empty chunk rather than returning early, so any live rows it
+		// replaces are still cleared from the terminal.
+		var logLines []string
+		if len(buf) > 0 {
+			logLines = splitLogBuffer(buf)
+		}
 		// Index of the log to start printing from. If earlier lines are
 		// already on screen, do not print them again.
 		printFrom := 0
@@ -851,6 +967,12 @@ func streamLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, inv
 	for _, chunk := range chunks {
 		drawChunk(chunk)
 	}
+	if *quiet {
+		if pending := quietLatest.flush(); pending != "" {
+			_, _ = os.Stdout.Write([]byte(pending + "\n"))
+		}
+		quietLatest.warnIfNothingKept()
+	}
 	return nil
 }
 
@@ -864,10 +986,11 @@ func printLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invo
 		return status.WrapError(err, "get event log")
 	}
 
+	var quietLog quietLogFilter
 	for {
 		_, l, err := stream.Recv()
 		if err == io.EOF {
-			return nil
+			break
 		}
 		if err != nil {
 			return status.WrapError(err, "read log stream")
@@ -877,8 +1000,19 @@ func printLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invo
 		if l.GetLive() {
 			continue
 		}
-		os.Stdout.Write(l.GetBuffer())
+		buf := l.GetBuffer()
+		if *quiet {
+			buf = []byte(quietLog.filter(string(buf)))
+		}
+		os.Stdout.Write(buf)
 	}
+	if *quiet {
+		if pending := quietLog.flush(); pending != "" {
+			os.Stdout.Write([]byte(pending))
+		}
+		quietLog.warnIfNothingKept()
+	}
+	return nil
 }
 
 func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceName *digest.CASResourceName, outFile string, mode os.FileMode) error {
@@ -1006,7 +1140,7 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		}
 		relArtifacts = append(relArtifacts, "  "+rp)
 	}
-	if len(relArtifacts) > 0 {
+	if len(relArtifacts) > 0 && !*quiet {
 		fmt.Printf("Downloaded artifacts:\n%s\n", strings.Join(relArtifacts, "\n"))
 	}
 	return downloadedFiles, nil
@@ -1230,7 +1364,9 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 	if len(encodedReq) > 0 {
 		log.Debugf("Run request: %s", string(encodedReq))
 	}
-	log.Printf("\nWaiting for available remote runner...\n")
+	if !*quiet {
+		log.Printf("\nWaiting for available remote runner...\n")
+	}
 
 	retry := !*disableRetry
 	retryCount := 0
@@ -1361,7 +1497,9 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 				execArgs := defaultRunArgs
 				// Pass through extra arguments (-- --foo=bar) from the command line.
 				execArgs = append(execArgs, opts.ExecArgs...)
-				log.Printf("Running downloaded executable %q locally (working directory %q)", absBinPath, runfilesWorkDir)
+				if !*quiet {
+					log.Printf("Running downloaded executable %q locally (working directory %q)", absBinPath, runfilesWorkDir)
+				}
 				cmd := exec.CommandContext(ctx, absBinPath, execArgs...)
 				cmd.Dir = runfilesWorkDir
 				cmd.Env = envForLocalRun(os.Environ(), runfilesDir, opts.AbsLocalWorkspaceDir, opts.AbsLocalWorkingDirectory)
@@ -1768,6 +1906,13 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Remove all cli flags from the arg list
 	argsRemoteFlagsRemoved := args[:endParsingIndex]
 	RemoteFlagset.VisitAll(func(f *flag.Flag) {
+		// arg.Pop treats `--name value` as a flag and its value, which for a
+		// boolean flag would consume whatever follows it - a bazel startup flag,
+		// say. Match boolean flags as standalone tokens instead.
+		if isBoolFlag(f) {
+			argsRemoteFlagsRemoved = removeBoolFlag(argsRemoteFlagsRemoved, f.Name)
+			return
+		}
 		// Certain flags with slice values can be passed multiple times.
 		// Remove all instances.
 		flagVal := "start"
@@ -1779,6 +1924,28 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Add back in the bazel command and any subsequent flags
 	argsRemoteFlagsRemoved = append(argsRemoteFlagsRemoved, args[endParsingIndex:]...)
 	return argsRemoteFlagsRemoved, nil
+}
+
+func isBoolFlag(f *flag.Flag) bool {
+	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && boolFlag.IsBoolFlag()
+}
+
+// removeBoolFlag removes every occurrence of the named boolean flag from args,
+// in any of the forms the flag package accepts (Ex. `-q`, `--quiet`,
+// `--quiet=true`).
+func removeBoolFlag(args []string, name string) []string {
+	kept := make([]string, 0, len(args))
+	for _, a := range args {
+		unprefixed := strings.TrimPrefix(strings.TrimPrefix(a, "--"), "-")
+		if a != unprefixed {
+			if flagName, _, _ := strings.Cut(unprefixed, "="); flagName == name {
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	return kept
 }
 
 func contains(m map[string]string, elem string) bool {
