@@ -877,6 +877,90 @@ func TestBashScript(t *testing.T) {
 	require.Contains(t, string(logResp.GetBuffer()), "Hello from the remote runner!")
 }
 
+// TestQuiet drives `bb remote -q` end to end - the CLI flag, the runner that
+// honors it - and checks that the invocation log holds only what the requested
+// command printed. The non-quiet case runs the same command as a control, so a
+// failure tells these apart: quiet mode stopped suppressing the narration, or
+// the narration stopped looking like this.
+func TestQuiet(t *testing.T) {
+	// Narration the runner writes around the requested command. These avoid
+	// the runner's color escapes, which fall between the `$` and the command
+	// line it echoes, so `$ git` never appears literally.
+	narration := []string{
+		"Configuring repository",
+		"Setup completed",
+		"command exited with code",
+		"Remote run completed at",
+	}
+	const commandOutput = "output of the requested command"
+
+	for _, tc := range []struct {
+		name          string
+		args          []string
+		wantNarration bool
+	}{
+		{name: "quiet", args: []string{"-q"}, wantNarration: false},
+		{name: "default", wantNarration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repoDir, _ := makeLocalGitRepo(t, map[string]string{})
+
+			// Run a server and executor locally to run remote bazel against
+			env, bbServer, _ := runLocalServerAndExecutor(t, "", "", nil)
+
+			args := append([]string{}, tc.args...)
+			args = append(args,
+				"--script=echo "+commandOutput,
+				fmt.Sprintf("--remote_header=x-buildbuddy-api-key=%s", env.APIKey1),
+			)
+			cliOutput := runRemoteBazelInSeparateProcess(t, repoDir, bbServer.GRPCAddress(), args...)
+
+			// Verify invocation logs.
+			bbClient := env.GetBuildBuddyServiceClient()
+			ctx := env.WithUserID(context.Background(), env.UserID1)
+			reqCtx := &ctxpb.RequestContext{
+				UserId:  &uidpb.UserId{Id: env.UserID1},
+				GroupId: env.GroupID1,
+			}
+			searchRsp, err := bbClient.SearchInvocation(ctx, &inpb.SearchInvocationRequest{
+				RequestContext: reqCtx,
+				Query:          &inpb.InvocationQuery{GroupId: env.GroupID1},
+			})
+			require.NoError(t, err)
+			require.Equal(t, 1, len(searchRsp.GetInvocation()))
+
+			logResp, err := bbClient.GetEventLogChunk(ctx, &elpb.GetEventLogChunkRequest{
+				InvocationId: searchRsp.Invocation[0].InvocationId,
+				MinLines:     math.MaxInt32,
+			})
+			require.NoError(t, err)
+			eventLog := string(logResp.GetBuffer())
+
+			// The requested command's output reaches the log either way.
+			require.Contains(t, eventLog, commandOutput)
+			// And reaches the terminal either way: quiet mode routes the
+			// runner's narration, it does not touch the streamed log.
+			require.Contains(t, cliOutput, commandOutput)
+
+			for _, n := range narration {
+				if tc.wantNarration {
+					require.Contains(t, eventLog, n)
+				} else {
+					require.NotContains(t, eventLog, n)
+				}
+			}
+
+			// The CLI's own progress output is a log level, so it goes quiet
+			// with the rest of the narration.
+			if tc.wantNarration {
+				require.Contains(t, cliOutput, "Waiting for available remote runner")
+			} else {
+				require.NotContains(t, cliOutput, "Waiting for available remote runner")
+			}
+		})
+	}
+}
+
 func TestBBRC(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	repoDir, _ := makeLocalGitRepo(t, map[string]string{
