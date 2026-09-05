@@ -539,11 +539,6 @@ func generatePatches(baseCommit string) ([][]byte, error) {
 	go func() {
 		select {
 		case <-time.After(500 * time.Millisecond):
-			// Quiet mode drops this despite being a warning: it reports
-			// slowness, not a problem with the run.
-			if *quiet {
-				return
-			}
 			log.Warnf("Mirroring your local git state is taking a long time." +
 				" See https://www.buildbuddy.io/docs/remote-bazel/#automatic-git-state-mirroring" +
 				" for more details and suggestions.")
