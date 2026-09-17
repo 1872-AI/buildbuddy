@@ -60,6 +60,7 @@ import (
 	apipb "github.com/buildbuddy-io/buildbuddy/proto/api/v1"
 	bepb "github.com/buildbuddy-io/buildbuddy/proto/build_events"
 	capb "github.com/buildbuddy-io/buildbuddy/proto/cache"
+	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
 	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
 	inspb "github.com/buildbuddy-io/buildbuddy/proto/invocation_status"
 	pgpb "github.com/buildbuddy-io/buildbuddy/proto/pagination"
@@ -829,9 +830,18 @@ type EventChannel struct {
 	requestedTerminalColumns         int
 	requestedTerminalLines           int
 	logWriter                        *eventlog.EventLogWriter
-	onClose                          func()
-	attempt                          uint64
-	groupIDForMetrics                string
+	// A producer that tells its output streams apart gets each one stored in its
+	// own log as well. logWriter keeps the merged view existing readers expect.
+	stdoutWriter    *eventlog.EventLogWriter
+	stderrWriter    *eventlog.EventLogWriter
+	narrationWriter *eventlog.EventLogWriter
+	// Whether this invocation's producer tells its output streams apart. Sticky
+	// once set: a later event carrying only stderr is still a split producer's,
+	// and gating on the fields themselves would drop it.
+	splitStreams      bool
+	onClose           func()
+	attempt           uint64
+	groupIDForMetrics string
 
 	// isVoid determines whether all EventChannel operations are NOPs. This is set
 	// when we're retrying an invocation that is already complete, or is
@@ -880,6 +890,20 @@ func (e *EventChannel) FinalizeInvocation(iid string) error {
 			} else {
 				return err
 			}
+		}
+	}
+	// Losing a split log should not fail the invocation: each duplicates content
+	// the build log already holds, and that is the one clients retry for.
+	for name, w := range map[string]*eventlog.EventLogWriter{
+		"stdout":    e.stdoutWriter,
+		"stderr":    e.stderrWriter,
+		"narration": e.narrationWriter,
+	} {
+		if w == nil {
+			continue
+		}
+		if err := w.Close(ctx); err != nil {
+			log.CtxWarningf(ctx, "Failed to flush %s log to blobstore: %s", name, err)
 		}
 	}
 	if e.logWriter != nil {
@@ -1232,6 +1256,34 @@ func (e *EventChannel) InitializeLogWriter(iid string) error {
 	return err
 }
 
+// writeSplitLog appends s to one of the split output logs, opening it on first
+// use.
+func (e *EventChannel) writeSplitLog(w **eventlog.EventLogWriter, iid string, logType elpb.LogType, s string) error {
+	if s == "" {
+		return nil
+	}
+	if *w == nil {
+		ctx := bazel_request.OverrideRequestMetadata(e.ctx, &repb.RequestMetadata{ToolInvocationId: iid})
+		var err error
+		*w, err = eventlog.NewEventLogWriter(
+			ctx,
+			e.env.GetBlobstore(),
+			e.env.GetKeyValStore(),
+			e.env.GetPubSub(),
+			e.env.GetExperimentFlagProvider(),
+			eventlog.LogPubSubChannel(logType, iid),
+			eventlog.SplitLogPath(logType, iid, e.attempt),
+			e.requestedTerminalColumns,
+			e.requestedTerminalLines,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := (*w).Write(e.ctx, []byte(s))
+	return err
+}
+
 func (e *EventChannel) processSingleEvent(event *inpb.InvocationEvent, iid string) error {
 	if err := e.redactor.RedactAPIKey(e.ctx, event.GetBuildEvent()); err != nil {
 		return err
@@ -1279,7 +1331,24 @@ func (e *EventChannel) processSingleEvent(event *inpb.InvocationEvent, iid strin
 					return err
 				}
 			}
-			n, err := e.logWriter.Write(e.ctx, append([]byte(p.Progress.GetStderr()), []byte(p.Progress.GetStdout())...))
+			// Store each stream on its own; the build log below still holds the
+			// merged view.
+			e.splitStreams = e.splitStreams || p.Progress.GetSplitStreams()
+			stdout, narration := p.Progress.GetStdout(), p.Progress.GetNarration()
+			if e.splitStreams {
+				if err := e.writeSplitLog(&e.stdoutWriter, iid, elpb.LogType_STDOUT_LOG, stdout); err != nil {
+					return err
+				}
+				if err := e.writeSplitLog(&e.narrationWriter, iid, elpb.LogType_NARRATION_LOG, narration); err != nil {
+					return err
+				}
+				if err := e.writeSplitLog(&e.stderrWriter, iid, elpb.LogType_STDERR_LOG, p.Progress.GetStderr()); err != nil {
+					return err
+				}
+			}
+			// The producer's stderr field already carries its narration
+			// interleaved, so the merged log keeps the order it always had.
+			n, err := e.logWriter.Write(e.ctx, []byte(p.Progress.GetStderr()+stdout))
 			if err == nil {
 				if n > 0 {
 					metrics.EventLogBytesWritten.With(map[string]string{

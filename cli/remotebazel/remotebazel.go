@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,7 +39,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/shlex"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 	"google.golang.org/grpc/metadata"
 
 	cmnpb "github.com/buildbuddy-io/buildbuddy/proto/api/v1/common"
@@ -102,30 +101,24 @@ var (
 	// pass github-related fields.
 	skipAutomaticCheckout = RemoteFlagset.Bool("skip_auto_checkout", false, "Whether to skip the automatic GitHub checkout steps on the remote runner.")
 	invocationIDFile      = RemoteFlagset.String("invocation_id_file", "", "If set, write the remote invocation ID to the file specified here.")
+	quiet                 = RemoteFlagset.Bool("quiet", false, "Print only the output of the command that ran remotely, so the run reads like a local bazel invocation.")
 )
 
-func consoleCursorMoveUp(y int) {
-	fmt.Print(escapeSeq + strconv.Itoa(y) + "A")
-}
-
-func consoleCursorMoveBeginningLine() {
-	fmt.Print(escapeSeq + "1G")
-}
-
-func consoleDeleteLines(n int) {
-	fmt.Print(escapeSeq + strconv.Itoa(n) + "M")
+func init() {
+	RemoteFlagset.BoolVar(quiet, "q", false, "Short alias for --quiet.")
 }
 
 func resetTerminalStyles() {
 	// Streamed remote logs can include ANSI style sequences. Ensure styles are
-	// reset before returning so subsequent local CLI output and the shell prompt
-	// do not inherit stale formatting.
+	// reset before returning so subsequent local CLI output and the shell
+	// prompt do not inherit stale formatting.
+	//
+	// Only ever on stderr: stdout carries the command's own output, and a
+	// caller redirecting it to a file or a pipe would get the escape in their
+	// data. Nothing is lost by skipping it when stderr is not a terminal -
+	// there is no terminal left holding stale styles.
 	if terminal.IsTTY(os.Stderr) {
 		fmt.Fprint(os.Stderr, escapeSeq+"0m")
-		return
-	}
-	if terminal.IsTTY(os.Stdout) {
-		fmt.Fprint(os.Stdout, escapeSeq+"0m")
 	}
 }
 
@@ -224,12 +217,25 @@ func determineRemote() (*gitRemote, error) {
 		remoteNames = append(remoteNames, fmt.Sprintf("%s (%s)", r.name, r.url))
 	}
 
+	// Nothing can answer a prompt without a terminal on both ends, and drawing
+	// one anyway leaves the run wedged on a question no one will see. Say what
+	// to set instead.
+	if !terminal.IsTTY(os.Stdin) || !terminal.IsTTY(os.Stderr) {
+		return nil, status.FailedPreconditionErrorf(
+			"multiple git remotes are configured (%s) and there is no terminal to ask which to use; "+
+				"pick one with `git config --local %s.%s <remote>`",
+			strings.Join(remoteNames, ", "), gitConfigSection, gitConfigRemoteBazelRemote)
+	}
+
 	selectedRemoteAndURL := ""
 	prompt := &survey.Select{
 		Message: "Select the git remote that will be used by the remote Bazel instance to fetch your repo:",
 		Options: remoteNames,
 	}
-	if err := survey.AskOne(prompt, &selectedRemoteAndURL); err != nil {
+	// Prompt on stderr, never stdout: stdout carries the output of the command
+	// being run remotely, and a caller piping it must not get a menu in their
+	// data.
+	if err := survey.AskOne(prompt, &selectedRemoteAndURL, survey.WithStdio(os.Stdin, os.Stderr, os.Stderr)); err != nil {
 		return nil, fmt.Errorf("select git remote: %w", err)
 	}
 
@@ -566,51 +572,12 @@ func generatePatches(baseCommit string) ([][]byte, error) {
 	return patches, nil
 }
 
-func getTermWidth() int {
-	size, err := unix.IoctlGetWinsize(int(os.Stdout.Fd()), unix.TIOCGWINSZ)
-	if err != nil || size.Col == 0 {
-		return 80
-	}
-	return int(size.Col)
-}
-
-// splitLogBuffer converts a byte buffer from the log API into terminal rows.
-func splitLogBuffer(buf []byte) []string {
-	var lines []string
-
-	termWidth := getTermWidth()
-	for line := range strings.SplitSeq(string(buf), "\n") {
-		for len(line) > termWidth {
-			lines = append(lines, line[0:termWidth])
-			line = line[termWidth:]
-		}
-		lines = append(lines, line)
-	}
-	return lines
-}
-
-func commonPrefixLineCount(a, b []string) int {
-	n := min(len(a), len(b))
-	for i := range n {
-		if a[i] != b[i] {
-			return i
-		}
-	}
-	return n
-}
-
-// liveLogUpdate returns the number of previously printed terminal rows to
-// remove, and the index in the current log buffer to start printing from.
-func liveLogUpdate(previous, current []string) (deleteCount int, printFrom int) {
-	commonPrefixLines := commonPrefixLineCount(previous, current)
-	return len(previous) - commonPrefixLines, commonPrefixLines
-}
-
-type logChunk struct {
-	id       string
-	response *elpb.GetEventLogChunkResponse
-}
-
+// logStream tails an invocation's log via the streaming GetEventLog API,
+// transparently reconnecting when the stream is dropped by a transient error
+// (e.g. the app restarting during a deploy).
+// logChunkID returns the ID of the chunk a response's buffer belongs to.
+// Responses do not carry it: a live chunk is identified by the next chunk ID,
+// while a finalized one is the chunk that was requested.
 func logChunkID(requestedChunkID string, response *elpb.GetEventLogChunkResponse) string {
 	if response.GetLive() {
 		return response.GetNextChunkId()
@@ -618,13 +585,13 @@ func logChunkID(requestedChunkID string, response *elpb.GetEventLogChunkResponse
 	return requestedChunkID
 }
 
-// logStream tails an invocation's log via the streaming GetEventLog API,
-// transparently reconnecting when the stream is dropped by a transient error
-// (e.g. the app restarting during a deploy).
 type logStream struct {
 	ctx          context.Context
 	client       bbspb.BuildBuddyServiceClient
 	invocationID string
+	// Which of the invocation's logs to read. Quiet mode reads the command's
+	// stdout and stderr separately so each can go to the matching stream here.
+	logType elpb.LogType
 
 	stream bbspb.BuildBuddyService_GetEventLogClient
 	// ID of the chunk the next received response corresponds to, mirroring
@@ -633,10 +600,13 @@ type logStream struct {
 	// TODO: this could be simplified if the server returned a chunk ID
 	// with each response.
 	chunkID string
+	// Whether any response has been received yet. Until one has, the
+	// invocation may simply not have been created, which reads as NotFound.
+	started bool
 }
 
-func openLogStream(ctx context.Context, client bbspb.BuildBuddyServiceClient, invocationID string) (*logStream, error) {
-	s := &logStream{ctx: ctx, client: client, invocationID: invocationID}
+func openLogStream(ctx context.Context, client bbspb.BuildBuddyServiceClient, invocationID string, logType elpb.LogType) (*logStream, error) {
+	s := &logStream{ctx: ctx, client: client, invocationID: invocationID, logType: logType}
 	if err := s.connect(); err != nil {
 		return nil, err
 	}
@@ -648,6 +618,7 @@ func (s *logStream) connect() error {
 		InvocationId: s.invocationID,
 		ChunkId:      s.chunkID,
 		MinLines:     100,
+		Type:         s.logType,
 	})
 	if err != nil {
 		return err
@@ -668,9 +639,15 @@ func (s *logStream) Recv() (string, *elpb.GetEventLogChunkResponse, error) {
 	}, func(ctx context.Context) (*elpb.GetEventLogChunkResponse, error) {
 		l, err := s.stream.Recv()
 		if err == nil {
+			s.started = true
 			return l, nil
 		}
-		if err == io.EOF || !status.IsUnavailableError(err) {
+		// A run's invocation is created once the runner starts reporting, a
+		// moment after the run is dispatched, so a NotFound before the first
+		// response means "not yet" rather than "gone". Several logs are read
+		// at once, so failing on it would fail the whole run.
+		retryable := status.IsUnavailableError(err) || (!s.started && status.IsNotFoundError(err))
+		if err == io.EOF || !retryable {
 			return nil, retry.NonRetryableError(err)
 		}
 		log.Debugf("Log stream interrupted, reconnecting: %s", err)
@@ -692,139 +669,214 @@ func (s *logStream) Recv() (string, *elpb.GetEventLogChunkResponse, error) {
 	return chunkID, l, nil
 }
 
-// streamLogs streams the logs with real-time progress updates. It uses ANSI
-// escape sequences to delete and rewrite outdated progress messages
-func streamLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) error {
-	// Disable printing input to the terminal, which could corrupt the log stream and break log de-duplication.
-	defer resetTerminalStyles()
-	restoreTerminalEcho, err := terminal.DisableEcho(os.Stdin)
-	if err != nil {
-		log.Warnf("Failed to disable terminal echo; typed input may interfere with remote log streaming: %s", err)
-	} else {
-		defer func() {
-			if err := restoreTerminalEcho(); err != nil {
-				log.Warnf("Failed to restore terminal echo: %s", err)
-			}
-		}()
+// logSink writes one of an invocation's logs to a stream of this process.
+//
+// The server re-renders the log's terminal screen on every write, so a live
+// view is settled bytes plus a volatile tail that can be rewritten in place,
+// shrink, or grow. Output that never moves the cursor only ever grows.
+type logSink struct {
+	w io.Writer
+	// Whether a rewritten tail can be erased and redrawn.
+	isTerminal bool
+	// Whether to close a style this log left open. Set only for the stream
+	// carrying diagnostics; the command's own output must match a local run.
+	closesStyles bool
+	// Written to w, but the server may still revise it or split it across a
+	// chunk boundary.
+	pending []byte
+}
+
+// live reconciles the latest live view of the log with what has been written.
+func (s *logSink) live(view []byte) error {
+	common := commonPrefixLen(s.pending, view)
+	if common == len(s.pending) {
+		// The tail only grew, so append what is new.
+		return s.emit(view[common:], view)
 	}
-
-	// ID of the live chunk currently drawn on the terminal.
-	liveChunkID := ""
-	// Buffer of lines currently printed to the terminal, kept so redraws do
-	// not reprint log lines that are already on screen.
-	var liveLines []string
-
-	drawChunk := func(chunk logChunk) {
-		// Skip empty responses, which the server sends while waiting for log
-		// chunks to be written. Drawing one would print a spurious blank row,
-		// since splitLogBuffer returns one empty row for an empty buffer.
-		if len(chunk.response.GetBuffer()) == 0 {
-			return
-		}
-		logLines := splitLogBuffer(chunk.response.GetBuffer())
-		// Index of the log to start printing from. If earlier lines are
-		// already on screen, do not print them again.
-		printFrom := 0
-
-		// Are we redrawing the current live chunk?
-		if liveChunkID == chunk.id {
-			deleteCount := 0
-			deleteCount, printFrom = liveLogUpdate(liveLines, logLines)
-			if deleteCount > 0 {
-				consoleCursorMoveUp(deleteCount)
-				consoleCursorMoveBeginningLine()
-				consoleDeleteLines(deleteCount)
-			}
-		} else if len(liveLines) > 0 {
-			// If we're printing logs from a new chunk, delete volatile log lines
-			// from the previous chunk.
-			consoleCursorMoveUp(len(liveLines))
-			consoleCursorMoveBeginningLine()
-			consoleDeleteLines(len(liveLines))
-		}
-
-		if !chunk.response.GetLive() {
-			liveChunkID = ""
-			liveLines = nil
-		} else {
-			liveChunkID = chunk.id
-			liveLines = logLines
-		}
-
-		for _, l := range logLines[printFrom:] {
-			_, _ = os.Stdout.Write([]byte(l))
-			_, _ = os.Stdout.Write([]byte("\n"))
+	if !s.isTerminal {
+		// Cannot redraw, so emit from the start of the changed row: the reader
+		// sees the old row followed by the new one rather than a spliced
+		// half-line.
+		return s.emit(view[lineStart(view, common):], view)
+	}
+	// Erase the rows that changed and write them again.
+	from := lineStart(s.pending, common)
+	if rows := lineCount(s.pending[from:]); rows > 0 {
+		if _, err := fmt.Fprintf(s.w, "%s%dA%s1G%s%dM", escapeSeq, rows, escapeSeq, escapeSeq, rows); err != nil {
+			return err
 		}
 	}
+	return s.emit(view[from:], view)
+}
 
-	stream, err := openLogStream(ctx, bbClient, invocationID)
-	if err != nil {
-		return status.WrapError(err, "get event log")
-	}
-
-	// Chunks received but not yet drawn (see comment below re. flicker)
-	var chunks []logChunk
-	wasLive := false
-	for {
-		requestedChunkID, l, err := stream.Recv()
-		if err == io.EOF {
-			break
+// settled records that the server finalized a chunk holding the first
+// len(chunk) pending bytes. Anything past them stays pending: the tail that did
+// not fit is served again as the start of the next chunk.
+func (s *logSink) settled(chunk []byte) error {
+	if len(chunk) > len(s.pending) {
+		// More was finalized than was shown live, as on a reconnect.
+		if err := s.live(chunk); err != nil {
+			return err
 		}
-		if err != nil {
-			return status.WrapError(err, "read log stream")
-		}
-
-		chunks = append(chunks, logChunk{id: logChunkID(requestedChunkID, l), response: l})
-		// If the current chunk was live but is no longer then delay redraw
-		// until the next chunk is retrieved. The "volatile" part of the
-		// chunk moves to the next chunk when a chunk is finalized. Without
-		// the delay, we would print the chunk without the volatile portion
-		// which will look like a "flicker" once the volatile portion is
-		// printed again.
-		delayRedraw := wasLive && !l.GetLive()
-		if !delayRedraw {
-			for _, chunk := range chunks {
-				drawChunk(chunk)
-			}
-			chunks = nil
-		}
-		wasLive = l.GetLive()
+		s.pending = s.pending[:0]
+		return nil
 	}
-
-	// The final chunk's redraw may have been delayed (see above) if it
-	// finalized a previously live chunk. Flush anything still pending so the
-	// last lines of the log are not dropped when the stream ends.
-	for _, chunk := range chunks {
-		drawChunk(chunk)
-	}
+	s.pending = append(s.pending[:0], s.pending[len(chunk):]...)
 	return nil
 }
 
-// printLogs prints logs for non-interactive mode, where we can't redraw the
-// live chunk. Each chunk is printed only when it is finalized.
-func printLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) error {
-	defer resetTerminalStyles()
+// reset drops pending bytes for a chunk this sink never saw finalized.
+func (s *logSink) reset() {
+	s.pending = s.pending[:0]
+}
 
-	stream, err := openLogStream(ctx, bbClient, invocationID)
+func (s *logSink) emit(b, view []byte) error {
+	if len(b) > 0 {
+		if _, err := s.w.Write(b); err != nil {
+			return err
+		}
+		// The renderer emits only style changes, so a chunk can end with a
+		// colour still set, which would tint whatever the other stream writes
+		// to this terminal next.
+		if s.closesStyles && s.isTerminal && leavesStyleOpen(b) {
+			if _, err := io.WriteString(s.w, escapeSeq+"0m"); err != nil {
+				return err
+			}
+		}
+	}
+	s.pending = append(s.pending[:0], view...)
+	return nil
+}
+
+var sgrPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// leavesStyleOpen reports whether b ends with a style still in effect. SGR 0
+// closes one, written either explicitly or as an empty parameter list.
+func leavesStyleOpen(b []byte) bool {
+	sgrs := sgrPattern.FindAll(b, -1)
+	if len(sgrs) == 0 {
+		return false
+	}
+	params := string(sgrs[len(sgrs)-1])
+	params = strings.TrimSuffix(strings.TrimPrefix(params, escapeSeq), "m")
+	for p := range strings.SplitSeq(params, ";") {
+		if p != "" && p != "0" {
+			return true
+		}
+	}
+	return false
+}
+
+func commonPrefixLen(a, b []byte) int {
+	n := min(len(a), len(b))
+	for i := range n {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// lineStart rounds an offset down to the start of the line it falls in.
+func lineStart(b []byte, offset int) int {
+	return bytes.LastIndexByte(b[:offset], '\n') + 1
+}
+
+func lineCount(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
+	return bytes.Count(b, []byte("\n")) + 1
+}
+
+// copyLog streams one of an invocation's logs to w as it is written, rather
+// than holding each chunk until it is finalized. Returns errUnsupportedLogType
+// if the server does not know the log type and served the build log instead.
+func copyLog(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string, logType elpb.LogType, w io.Writer, isTerminal, closesStyles bool) error {
+	stream, err := openLogStream(ctx, bbClient, invocationID, logType)
 	if err != nil {
 		return status.WrapError(err, "get event log")
 	}
-
+	sink := &logSink{w: w, isTerminal: isTerminal, closesStyles: closesStyles}
+	// The chunk the pending bytes belong to, and whether they carried over from
+	// a chunk that just finalized, which the next chunk then starts with.
+	chunkID := ""
+	carried := false
 	for {
-		_, l, err := stream.Recv()
+		id, l, err := stream.Recv()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return status.WrapError(err, "read log stream")
 		}
-		// Live chunks are still subject to change; only print each chunk once
-		// the server finalizes it, so lines are printed exactly once.
-		if l.GetLive() {
+		if l.GetServedType() != logType {
+			return errUnsupportedLogType
+		}
+		if !l.GetLive() {
+			if err := sink.settled(l.GetBuffer()); err != nil {
+				return status.WrapError(err, "write log")
+			}
+			chunkID, carried = "", true
 			continue
 		}
-		os.Stdout.Write(l.GetBuffer())
+		if logChunkID(id, l) != chunkID && !carried {
+			// Nothing pending relates to the chunk now being served.
+			sink.reset()
+		}
+		chunkID, carried = logChunkID(id, l), false
+		if err := sink.live(l.GetBuffer()); err != nil {
+			return status.WrapError(err, "write log")
+		}
 	}
+}
+
+// errUnsupportedLogType reports a server that predates the split log types.
+var errUnsupportedLogType = status.UnimplementedError("server does not serve this log type")
+
+// sameDestination reports whether two of this process's streams lead to the
+// same place, as they do on a terminal or under `> file 2>&1`.
+func sameDestination(a, b *os.File) bool {
+	ai, err := a.Stat()
+	if err != nil {
+		return false
+	}
+	bi, err := b.Stat()
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
+// printLogs writes the invocation's output the way a local run would: the
+// command's stdout to stdout, and its stderr - with the runner's narration
+// interleaved - to stderr. Quiet mode is applied by the runner, which reports
+// no narration at all.
+func printLogs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) error {
+	defer resetTerminalStyles()
+
+	// Two readers on two logs cannot preserve the order the streams interleave
+	// in. The merged log can, since the app writes each progress event's stderr
+	// and stdout together, so read that when the interleaving is visible.
+	if sameDestination(os.Stdout, os.Stderr) {
+		return copyLog(ctx, bbClient, invocationID, elpb.LogType_BUILD_LOG, os.Stderr, terminal.IsTTY(os.Stderr), true /*=closesStyles*/)
+	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		return copyLog(egCtx, bbClient, invocationID, elpb.LogType_STDOUT_LOG, os.Stdout, terminal.IsTTY(os.Stdout), false /*=closesStyles*/)
+	})
+	eg.Go(func() error {
+		return copyLog(egCtx, bbClient, invocationID, elpb.LogType_STDERR_LOG, os.Stderr, terminal.IsTTY(os.Stderr), true /*=closesStyles*/)
+	})
+	err := eg.Wait()
+	if status.IsUnimplementedError(err) {
+		// The server predates the split logs; fall back to what a client saw
+		// before them: everything on stderr, nothing on stdout.
+		log.Debugf("Server does not serve split output logs; falling back to the build log.")
+		return copyLog(ctx, bbClient, invocationID, elpb.LogType_BUILD_LOG, os.Stderr, terminal.IsTTY(os.Stderr), true /*=closesStyles*/)
+	}
+	return err
 }
 
 func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceName *digest.CASResourceName, outFile string, mode os.FileMode) error {
@@ -952,8 +1004,11 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		}
 		relArtifacts = append(relArtifacts, "  "+rp)
 	}
+	// log.Printf, so this lands on stderr and goes quiet with the rest of the
+	// CLI's commentary. stdout carries the remote command's own output, and a
+	// caller piping it must not find this in their data.
 	if len(relArtifacts) > 0 {
-		fmt.Printf("Downloaded artifacts:\n%s\n", strings.Join(relArtifacts, "\n"))
+		log.Printf("Downloaded artifacts:\n%s", strings.Join(relArtifacts, "\n"))
 	}
 	return downloadedFiles, nil
 }
@@ -1171,11 +1226,8 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 				Run: opts.Command,
 			},
 		},
-		RunnerFlags: []string{fmt.Sprintf("--skip_auto_checkout=%v", *skipAutomaticCheckout)},
-	}
-
-	if *gitFetchDepth >= 0 {
-		req.RunnerFlags = append(req.RunnerFlags, fmt.Sprintf("--git_fetch_depth=%d", *gitFetchDepth))
+		RunnerFlags:   runnerFlags(),
+		OutputOptions: outputOptions(),
 	}
 
 	req.GetRepoState().Patch = append(req.GetRepoState().Patch, repoConfig.Patches...)
@@ -1351,6 +1403,30 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 	return exitCode, nil
 }
 
+// runnerFlags returns the flags for the remote runner itself, not for the bazel
+// command it runs.
+func runnerFlags() []string {
+	flags := []string{fmt.Sprintf("--skip_auto_checkout=%v", *skipAutomaticCheckout)}
+	if *gitFetchDepth >= 0 {
+		flags = append(flags, fmt.Sprintf("--git_fetch_depth=%d", *gitFetchDepth))
+	}
+	return flags
+}
+
+// outputOptions describes how this process wants the run's output reported.
+// These go to the app as request fields rather than runner flags: the app
+// ships the runner and turns them into the flags that runner knows, so an
+// older app drops them and runs as it always has, where an unrecognized
+// runner flag would fail the run outright.
+func outputOptions() *rnpb.OutputOptions {
+	return &rnpb.OutputOptions{
+		Quiet:        *quiet,
+		SplitStreams: true,
+		StdoutIsTty:  term.IsTerminal(int(os.Stdout.Fd())),
+		StderrIsTty:  term.IsTerminal(int(os.Stderr.Fd())),
+	}
+}
+
 func attemptRun(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, execClient repb.ExecutionClient, req *rnpb.RunRequest) (*inpb.GetInvocationResponse, *repb.ExecuteResponse, error) {
 	var inRsp *inpb.GetInvocationResponse
 	var execRsp *repb.ExecuteResponse
@@ -1378,15 +1454,10 @@ func attemptRun(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, exe
 		}
 	}()
 
-	interactive := terminal.IsTTY(os.Stdin) && terminal.IsTTY(os.Stderr)
-	if interactive {
-		if err := streamLogs(ctx, bbClient, iid); err != nil {
-			return nil, nil, status.WrapError(err, "streaming logs")
-		}
-	} else {
-		if err := printLogs(ctx, bbClient, iid); err != nil {
-			return nil, nil, status.WrapError(err, "streaming logs")
-		}
+	// Every stream is written to the fd it belongs on, so there is no single
+	// merged stream for the redrawing streamer to own.
+	if err := printLogs(ctx, bbClient, iid); err != nil {
+		return nil, nil, status.WrapError(err, "streaming logs")
 	}
 	isInvocationRunning = false
 
@@ -1482,6 +1553,7 @@ func HandleRemoteBazel(commandLineArgs []string) (int, error) {
 	if err != nil {
 		return 1, status.WrapError(err, "parse cli flags")
 	}
+	log.SetQuiet(*quiet)
 
 	tempDir, err := os.MkdirTemp("", "buildbuddy-cli-*")
 	if err != nil {
@@ -1736,6 +1808,12 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Remove all cli flags from the arg list
 	argsRemoteFlagsRemoved := args[:endParsingIndex]
 	RemoteFlagset.VisitAll(func(f *flag.Flag) {
+		// arg.Pop reads `--name value`, so for a boolean flag it would consume
+		// whatever follows - a bazel startup flag, say.
+		if isBoolFlag(f) {
+			argsRemoteFlagsRemoved = removeBoolFlag(argsRemoteFlagsRemoved, f.Name)
+			return
+		}
 		// Certain flags with slice values can be passed multiple times.
 		// Remove all instances.
 		flagVal := "start"
@@ -1747,6 +1825,27 @@ func parseRemoteCliFlags(args []string) ([]string, error) {
 	// Add back in the bazel command and any subsequent flags
 	argsRemoteFlagsRemoved = append(argsRemoteFlagsRemoved, args[endParsingIndex:]...)
 	return argsRemoteFlagsRemoved, nil
+}
+
+func isBoolFlag(f *flag.Flag) bool {
+	boolFlag, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && boolFlag.IsBoolFlag()
+}
+
+// removeBoolFlag removes the named boolean flag in every form the flag package
+// accepts (Ex. `-q`, `--quiet`, `--quiet=true`).
+func removeBoolFlag(args []string, name string) []string {
+	kept := make([]string, 0, len(args))
+	for _, a := range args {
+		unprefixed := strings.TrimPrefix(strings.TrimPrefix(a, "--"), "-")
+		if a != unprefixed {
+			if flagName, _, _ := strings.Cut(unprefixed, "="); flagName == name {
+				continue
+			}
+		}
+		kept = append(kept, a)
+	}
+	return kept
 }
 
 func contains(m map[string]string, elem string) bool {
