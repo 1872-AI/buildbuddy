@@ -460,10 +460,17 @@ func getCurrentRef() (string, error) {
 	detachedHeadOutput, _ := runGit("branch")
 	regex := regexp.MustCompile(".*detached (at|from) ([^)]+).*")
 	matches := regex.FindStringSubmatch(detachedHeadOutput)
-	if len(matches) != 3 {
-		return "", status.UnknownErrorf("unexpected branch state %s", detachedHeadOutput)
+	if len(matches) == 3 {
+		return strings.TrimSpace(matches[2]), nil
 	}
-	return strings.TrimSpace(matches[2]), nil
+
+	// Without a checkout entry in the HEAD reflog (e.g. after `git worktree add --detach`),
+	// `git branch` prints "(no branch)". The commit itself is still a usable ref.
+	headCommit, err := runGit("rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return "", status.WrapErrorf(err, "resolve detached HEAD (git branch output: %s)", detachedHeadOutput)
+	}
+	return strings.TrimSpace(headCommit), nil
 }
 
 // branchTrackedRemotely returns whether the given branch exists remotely, as reflected in
