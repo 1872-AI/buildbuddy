@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
@@ -1298,4 +1299,49 @@ func TestDownloadOutputs_WrapsDownloadErrors(t *testing.T) {
 	_, err := downloadOutputs(context.Background(), envWithByteStreamClient(bsClient), nil, runfiles, nil, t.TempDir())
 
 	require.ErrorContains(t, err, `download runfile "gone": download output "gone"`)
+}
+
+func TestDownloadOutputs_SupportingDirsSkipUpToDateFiles(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	toolContents := bytes.Repeat([]byte("tool"), 100)
+	readmeContents := []byte("readme")
+	toolDigest, err := digest.Compute(bytes.NewReader(toolContents), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	readmeDigest, err := digest.Compute(bytes.NewReader(readmeContents), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	bsClient.addBlob(t, toolContents)
+	bsClient.addBlob(t, readmeContents)
+	binDir := &repb.Directory{Files: []*repb.FileNode{{Name: "tool", Digest: toolDigest, IsExecutable: true}}}
+	binDirDigest, err := digest.ComputeForMessage(binDir, repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	tree := &repb.Tree{
+		Root: &repb.Directory{
+			Files:       []*repb.FileNode{{Name: "README", Digest: readmeDigest}},
+			Directories: []*repb.DirectoryNode{{Name: "bin", Digest: binDirDigest}},
+			Symlinks:    []*repb.SymlinkNode{{Name: "tool", Target: "bin/tool"}},
+		},
+		Children: []*repb.Directory{binDir},
+	}
+	treeBytes, err := proto.Marshal(tree)
+	require.NoError(t, err)
+	treeURI := bsClient.addBlob(t, treeBytes)
+	supportingDirs := []*bespb.Tree{{Name: "plugin", Uri: treeURI}}
+	env := envWithByteStreamClient(bsClient)
+	outputBaseDir := t.TempDir()
+	pluginDir := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, "plugin")
+
+	downloaded, err := downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
+	require.NoError(t, err)
+	require.Empty(t, downloaded, "only per-file outputs are candidates for the run executable")
+	require.Equal(t, 3, bsClient.readCount())
+	got, err := os.ReadFile(filepath.Join(pluginDir, "tool"))
+	require.NoError(t, err, "the symlink should resolve to the downloaded file")
+	require.Equal(t, toolContents, got)
+	info, err := os.Stat(filepath.Join(pluginDir, "bin", "tool"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0755), info.Mode().Perm())
+
+	_, err = downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
+	require.NoError(t, err)
+	require.Equal(t, 4, bsClient.readCount(), "second run should fetch only the tree metadata")
 }

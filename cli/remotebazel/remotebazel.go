@@ -839,6 +839,12 @@ func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceN
 		}
 		return nil
 	}
+	// os.Create would write through a symlink a previous run left here.
+	if info, err := os.Lstat(outFile); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(outFile); err != nil {
+			return fmt.Errorf("remove stale symlink %q: %w", outFile, err)
+		}
+	}
 	out, err := os.Create(outFile)
 	if err != nil {
 		return fmt.Errorf("create output file %q: %w", outFile, err)
@@ -866,6 +872,21 @@ func localFileMatchesDigest(outFile string, resourceName *digest.CASResourceName
 		return false
 	}
 	return localDigest.GetHash() == resourceName.GetDigest().GetHash()
+}
+
+// replaceSymlink points newName at target,
+// replacing whatever a previous run left at that path.
+func replaceSymlink(target, newName string) error {
+	if existing, err := os.Readlink(newName); err == nil && existing == target {
+		return nil
+	}
+	if err := os.RemoveAll(newName); err != nil {
+		return fmt.Errorf("remove stale %q: %w", newName, err)
+	}
+	if err := os.Symlink(target, newName); err != nil {
+		return fmt.Errorf("create symlink %q: %w", newName, err)
+	}
+	return nil
 }
 
 func lookupBazelInvocationOutputs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) ([]*bespb.File, error) {
@@ -912,16 +933,24 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	bsClient := env.GetByteStreamClient()
 
 	type pendingDownload struct {
-		file         *bespb.File
+		name         string
 		resourceName *digest.CASResourceName
 		mode         os.FileMode
-		// Wraps a download failure with which list the file came from.
+		// Says which list the file came from, e.g. `download runfile "x"`.
 		errorPrefix string
 	}
 	// Keyed by local path: the run executable is usually both a main output
 	// and a runfile, and two concurrent writers to one path would corrupt it.
 	downloads := make(map[string]*pendingDownload)
 	var downloadOrder []string
+	queueDownload := func(outFile, name string, r *digest.CASResourceName, mode os.FileMode, errorPrefix string) {
+		if existing, ok := downloads[outFile]; ok {
+			existing.mode |= mode
+			return
+		}
+		downloads[outFile] = &pendingDownload{name: name, resourceName: r, mode: mode, errorPrefix: errorPrefix}
+		downloadOrder = append(downloadOrder, outFile)
+	}
 	addDownload := func(f *bespb.File, mode os.FileMode, errorPrefix string) (string, error) {
 		r, err := bytestreamURIToResourceName(f.GetUri())
 		if err != nil {
@@ -932,12 +961,7 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 			outFile = filepath.Join(outFile, p)
 		}
 		outFile = filepath.Clean(filepath.Join(outFile, f.GetName()))
-		if existing, ok := downloads[outFile]; ok {
-			existing.mode |= mode
-			return outFile, nil
-		}
-		downloads[outFile] = &pendingDownload{file: f, resourceName: r, mode: mode, errorPrefix: errorPrefix}
-		downloadOrder = append(downloadOrder, outFile)
+		queueDownload(outFile, f.GetName(), r, mode, fmt.Sprintf("%s %q", errorPrefix, f.GetName()))
 		return outFile, nil
 	}
 
@@ -959,27 +983,11 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 			return nil, err
 		}
 	}
-
-	eg, egCtx := errgroup.WithContext(ctx)
-	eg.SetLimit(max(1, *downloadConcurrency))
-	for _, outFile := range downloadOrder {
-		d := downloads[outFile]
-		eg.Go(func() error {
-			log.Debugf("Downloading output %q to %q with mode %s", d.file.GetName(), outFile, d.mode)
-			if err := downloadFile(egCtx, bsClient, d.resourceName, outFile, d.mode); err != nil {
-				return fmt.Errorf("%s %q: download output %q: %w", d.errorPrefix, d.file.GetName(), d.file.GetName(), err)
-			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
-	downloadedFiles := make(map[string]struct{}, len(downloads))
-	for outFile := range downloads {
-		downloadedFiles[outFile] = struct{}{}
-	}
-
+	// Only the run executable's lookup reads downloadedFiles,
+	// so tree-artifact contents stay out of it.
+	perFileDownloads := len(downloads)
+	// Tree artifacts go through the same pool rather than dirtools.DownloadTree,
+	// which re-fetches every file on every run.
 	for _, d := range supportingDirs {
 		rn, err := bytestreamURIToResourceName(d.GetUri())
 		if err != nil {
@@ -989,13 +997,63 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		if err := cachetools.GetBlobAsProto(ctx, bsClient, rn, tree); err != nil {
 			return nil, fmt.Errorf("download supporting output dir metadata %q: %w", d.GetName(), err)
 		}
-		outDir := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, d.GetName())
-		if err := os.MkdirAll(outDir, 0755); err != nil {
-			return nil, fmt.Errorf("create supporting output dir %q: %w", outDir, err)
+		rootDigest, dirMap, err := dirtools.DirMapFromTree(tree, rn.GetDigestFunction())
+		if err != nil {
+			return nil, fmt.Errorf("read supporting output dir metadata %q: %w", d.GetName(), err)
 		}
-		if _, err := dirtools.DownloadTree(ctx, env, rn.GetInstanceName(), rn.GetDigestFunction(), tree, &dirtools.DownloadTreeOpts{RootDir: outDir}); err != nil {
-			return nil, fmt.Errorf("download supporting output dir %q: %w", d.GetName(), err)
+		errorPrefix := fmt.Sprintf("download supporting output dir %q", d.GetName())
+		var queueDir func(dirDigest *repb.Digest, outDir string) error
+		queueDir = func(dirDigest *repb.Digest, outDir string) error {
+			dir, ok := dirMap[digest.NewKey(dirDigest)]
+			if !ok {
+				return fmt.Errorf("%s: directory %q is missing from its tree", errorPrefix, outDir)
+			}
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				return fmt.Errorf("%s: create dir %q: %w", errorPrefix, outDir, err)
+			}
+			for _, fileNode := range dir.GetFiles() {
+				mode := os.FileMode(0644)
+				if fileNode.GetIsExecutable() {
+					mode = 0755
+				}
+				r := digest.NewCASResourceName(fileNode.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction())
+				queueDownload(filepath.Join(outDir, fileNode.GetName()), fileNode.GetName(), r, mode, errorPrefix)
+			}
+			for _, symlinkNode := range dir.GetSymlinks() {
+				if err := replaceSymlink(symlinkNode.GetTarget(), filepath.Join(outDir, symlinkNode.GetName())); err != nil {
+					return fmt.Errorf("%s: %w", errorPrefix, err)
+				}
+			}
+			for _, dirNode := range dir.GetDirectories() {
+				if err := queueDir(dirNode.GetDigest(), filepath.Join(outDir, dirNode.GetName())); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
+		if err := queueDir(rootDigest, filepath.Join(outputBaseDir, BuildBuddyArtifactDir, d.GetName())); err != nil {
+			return nil, err
+		}
+	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(max(1, *downloadConcurrency))
+	for _, outFile := range downloadOrder {
+		d := downloads[outFile]
+		eg.Go(func() error {
+			log.Debugf("Downloading output %q to %q with mode %s", d.name, outFile, d.mode)
+			if err := downloadFile(egCtx, bsClient, d.resourceName, outFile, d.mode); err != nil {
+				return fmt.Errorf("%s: download output %q: %w", d.errorPrefix, d.name, err)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	downloadedFiles := make(map[string]struct{}, perFileDownloads)
+	for _, outFile := range downloadOrder[:perFileDownloads] {
+		downloadedFiles[outFile] = struct{}{}
 	}
 
 	// Format as relative paths with indentation for human consumption.
