@@ -88,6 +88,7 @@ var (
 	timeout                 = RemoteFlagset.Duration("timeout", 0, "If set, requests that have exceeded this timeout will be canceled automatically. (Ex. --timeout=15m; --timeout=2h)")
 	execPropsFlag           = bbflag.New(RemoteFlagset, "runner_exec_properties", []string{}, "Exec properties that will apply to the *ci runner execution*. Key-value pairs should be separated by '=' (Ex. --runner_exec_properties=NAME=VALUE). Can be specified more than once. NOTE: If you want to apply an exec property to the bazel command that's run on the runner, just pass at the end of the command (Ex. bb remote build //... --remote_default_exec_properties=OSFamily=linux).")
 	remoteHeaders           = bbflag.New(RemoteFlagset, "remote_run_header", []string{}, "Remote headers to be applied to the execution request for the remote run. Can be used to set platform properties containing secrets (Ex. --remote_run_header=x-buildbuddy-platform.SECRET_NAME=SECRET_VALUE). Can be specified more than once.")
+	downloadConcurrency     = RemoteFlagset.Int("download_concurrency", 32, "For `run` commands with --run_remotely=false, the maximum number of outputs and runfiles downloaded at once.")
 	runRemotely             = RemoteFlagset.Bool("run_remotely", true, "For `run` commands, whether the target should be run remotely. If false, the target will be built remotely, and then fetched and run locally.")
 	useSystemGitCredentials = RemoteFlagset.Bool("use_system_git_credentials", false, "Whether to use github auth pre-configured on the remote runner. If false, require https and an access token for git access.")
 	runFromBranch           = RemoteFlagset.String("run_from_branch", "", "A GitHub branch to base the remote run off. If unset, the remote workspace will mirror your local workspace.")
@@ -831,6 +832,13 @@ func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceN
 	if err := os.MkdirAll(filepath.Dir(outFile), 0755); err != nil {
 		return fmt.Errorf("create output dir for %q: %w", outFile, err)
 	}
+	if localFileMatchesDigest(outFile, resourceName) {
+		log.Debugf("Output %q is already up to date", outFile)
+		if err := os.Chmod(outFile, mode); err != nil {
+			return fmt.Errorf("set permissions on output file %q: %w", outFile, err)
+		}
+		return nil
+	}
 	out, err := os.Create(outFile)
 	if err != nil {
 		return fmt.Errorf("create output file %q: %w", outFile, err)
@@ -843,6 +851,21 @@ func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceN
 		return fmt.Errorf("set permissions on output file %q: %w", outFile, err)
 	}
 	return nil
+}
+
+// localFileMatchesDigest reports whether outFile is a regular file
+// whose contents already match resourceName,
+// comparing sizes first so a stale file is usually rejected without hashing it.
+func localFileMatchesDigest(outFile string, resourceName *digest.CASResourceName) bool {
+	info, err := os.Lstat(outFile)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != resourceName.GetDigest().GetSizeBytes() {
+		return false
+	}
+	localDigest, err := digest.ComputeForFile(outFile, resourceName.GetDigestFunction())
+	if err != nil {
+		return false
+	}
+	return localDigest.GetHash() == resourceName.GetDigest().GetHash()
 }
 
 func lookupBazelInvocationOutputs(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, invocationID string) ([]*bespb.File, error) {
@@ -885,33 +908,44 @@ func bytestreamURIToResourceName(uri string) (*digest.CASResourceName, error) {
 }
 
 // TODO(vadim): add interactive progress bar for downloads
-// TODO(vadim): parallelize downloads
 func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*bespb.File, runfiles []*bespb.Runfile, supportingDirs []*bespb.Tree, outputBaseDir string) (map[string]struct{}, error) {
 	bsClient := env.GetByteStreamClient()
 
-	var mainLocalArtifacts []string
-	downloadedFiles := make(map[string]struct{})
-	download := func(f *bespb.File, mode os.FileMode) (string, error) {
+	type pendingDownload struct {
+		file         *bespb.File
+		resourceName *digest.CASResourceName
+		mode         os.FileMode
+		// Wraps a download failure with which list the file came from.
+		errorPrefix string
+	}
+	// Keyed by local path: the run executable is usually both a main output
+	// and a runfile, and two concurrent writers to one path would corrupt it.
+	downloads := make(map[string]*pendingDownload)
+	var downloadOrder []string
+	addDownload := func(f *bespb.File, mode os.FileMode, errorPrefix string) (string, error) {
 		r, err := bytestreamURIToResourceName(f.GetUri())
 		if err != nil {
-			return "", fmt.Errorf("resolve output uri for %q: %w", f.GetName(), err)
+			return "", fmt.Errorf("%s %q: resolve output uri for %q: %w", errorPrefix, f.GetName(), f.GetName(), err)
 		}
 		outFile := filepath.Join(outputBaseDir, BuildBuddyArtifactDir)
 		for _, p := range f.GetPathPrefix() {
 			outFile = filepath.Join(outFile, p)
 		}
-		outFile = filepath.Join(outFile, f.GetName())
-		log.Debugf("Downloading output %q to %q with mode %s", f.GetName(), outFile, mode)
-		if err := downloadFile(ctx, bsClient, r, outFile, mode); err != nil {
-			return "", fmt.Errorf("download output %q: %w", f.GetName(), err)
+		outFile = filepath.Clean(filepath.Join(outFile, f.GetName()))
+		if existing, ok := downloads[outFile]; ok {
+			existing.mode |= mode
+			return outFile, nil
 		}
-		downloadedFiles[filepath.Clean(outFile)] = struct{}{}
+		downloads[outFile] = &pendingDownload{file: f, resourceName: r, mode: mode, errorPrefix: errorPrefix}
+		downloadOrder = append(downloadOrder, outFile)
 		return outFile, nil
 	}
+
+	var mainLocalArtifacts []string
 	for _, f := range mainOutputs {
-		outFile, err := download(f, 0644)
+		outFile, err := addDownload(f, 0644, "download main output")
 		if err != nil {
-			return nil, fmt.Errorf("download main output %q: %w", f.GetName(), err)
+			return nil, err
 		}
 		mainLocalArtifacts = append(mainLocalArtifacts, outFile)
 	}
@@ -921,10 +955,31 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		if rf.GetIsExecutable() {
 			mode = 0755
 		}
-		if _, err := download(rf.GetFile(), mode); err != nil {
-			return nil, fmt.Errorf("download runfile %q: %w", rf.GetFile().GetName(), err)
+		if _, err := addDownload(rf.GetFile(), mode, "download runfile"); err != nil {
+			return nil, err
 		}
 	}
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(max(1, *downloadConcurrency))
+	for _, outFile := range downloadOrder {
+		d := downloads[outFile]
+		eg.Go(func() error {
+			log.Debugf("Downloading output %q to %q with mode %s", d.file.GetName(), outFile, d.mode)
+			if err := downloadFile(egCtx, bsClient, d.resourceName, outFile, d.mode); err != nil {
+				return fmt.Errorf("%s %q: download output %q: %w", d.errorPrefix, d.file.GetName(), d.file.GetName(), err)
+			}
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	downloadedFiles := make(map[string]struct{}, len(downloads))
+	for outFile := range downloads {
+		downloadedFiles[outFile] = struct{}{}
+	}
+
 	for _, d := range supportingDirs {
 		rn, err := bytestreamURIToResourceName(d.GetUri())
 		if err != nil {

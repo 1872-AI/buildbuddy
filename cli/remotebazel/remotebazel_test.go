@@ -1,6 +1,7 @@
 package remotebazel
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -17,8 +18,12 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/cli/parser"
 	"github.com/buildbuddy-io/buildbuddy/cli/parser/test_data"
 	"github.com/buildbuddy-io/buildbuddy/cli/storage"
+	"github.com/buildbuddy-io/buildbuddy/server/environment"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testgit"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testshell"
+	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lockingbuffer"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/terminal"
@@ -30,6 +35,8 @@ import (
 	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
 	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
+	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	bspb "google.golang.org/genproto/googleapis/bytestream"
 )
 
 func init() {
@@ -1125,4 +1132,170 @@ func runPrintLogsWithCapturedStdout(t *testing.T, client bbspb.BuildBuddyService
 	out, err := io.ReadAll(r)
 	require.NoError(t, err)
 	return string(out), printErr
+}
+
+// fakeByteStreamClient serves blobs by hash, counting reads.
+// If readBarrier is set, each Read blocks until that many reads are in flight at once.
+type fakeByteStreamClient struct {
+	bspb.ByteStreamClient
+
+	blobs map[string][]byte
+
+	mu          sync.Mutex
+	reads       int
+	inFlight    int
+	readBarrier int
+	allInFlight chan struct{}
+}
+
+func newFakeByteStreamClient() *fakeByteStreamClient {
+	return &fakeByteStreamClient{blobs: map[string][]byte{}, allInFlight: make(chan struct{})}
+}
+
+// addBlob stores data and returns the bytestream URI the BES would report for it.
+func (c *fakeByteStreamClient) addBlob(t *testing.T, data []byte) string {
+	d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	c.blobs[d.GetHash()] = data
+	return "bytestream://cache.example/" + digest.NewCASResourceName(d, "", repb.DigestFunction_SHA256).DownloadString()
+}
+
+func (c *fakeByteStreamClient) Read(ctx context.Context, req *bspb.ReadRequest, opts ...grpc.CallOption) (bspb.ByteStream_ReadClient, error) {
+	rn, err := digest.ParseDownloadResourceName(req.GetResourceName())
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.reads++
+	c.inFlight++
+	if c.inFlight == c.readBarrier {
+		close(c.allInFlight)
+	}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.inFlight--
+		c.mu.Unlock()
+	}()
+	if c.readBarrier > 0 {
+		select {
+		case <-c.allInFlight:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	data, ok := c.blobs[rn.GetDigest().GetHash()]
+	if !ok {
+		return nil, status.NotFoundErrorf("blob %s not found", rn.GetDigest().GetHash())
+	}
+	if rn.GetCompressor() == repb.Compressor_ZSTD {
+		data = compression.CompressZstd(nil, data)
+	}
+	return &fakeReadStream{data: data}, nil
+}
+
+func (c *fakeByteStreamClient) readCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+type fakeReadStream struct {
+	grpc.ClientStream
+
+	data []byte
+	sent bool
+}
+
+func (s *fakeReadStream) Recv() (*bspb.ReadResponse, error) {
+	if s.sent {
+		return nil, io.EOF
+	}
+	s.sent = true
+	return &bspb.ReadResponse{Data: s.data}, nil
+}
+
+func envWithByteStreamClient(bsClient bspb.ByteStreamClient) environment.Env {
+	env := real_environment.NewBatchEnv()
+	env.SetByteStreamClient(bsClient)
+	return env
+}
+
+func TestDownloadOutputs_DownloadsConcurrently(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	var runfiles []*bespb.Runfile
+	for i := range 4 {
+		uri := bsClient.addBlob(t, bytes.Repeat([]byte{byte('a' + i)}, 200))
+		runfiles = append(runfiles, &bespb.Runfile{File: &bespb.File{Name: fmt.Sprintf("file%d", i), File: &bespb.File_Uri{Uri: uri}}})
+	}
+	// A serial downloader never gets more than one read in flight,
+	// so it blocks here until the context deadline instead of passing.
+	bsClient.readBarrier = len(runfiles)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	outputBaseDir := t.TempDir()
+
+	downloaded, err := downloadOutputs(ctx, envWithByteStreamClient(bsClient), nil, runfiles, nil, outputBaseDir)
+
+	require.NoError(t, err)
+	require.Len(t, downloaded, len(runfiles))
+	for i := range 4 {
+		got, err := os.ReadFile(filepath.Join(outputBaseDir, BuildBuddyArtifactDir, fmt.Sprintf("file%d", i)))
+		require.NoError(t, err)
+		require.Equal(t, bytes.Repeat([]byte{byte('a' + i)}, 200), got)
+	}
+}
+
+func TestDownloadOutputs_SkipsUpToDateFiles(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	binContents := []byte("#!/bin/sh\necho hi\n")
+	dataContents := bytes.Repeat([]byte("data"), 100)
+	binURI := bsClient.addBlob(t, binContents)
+	dataURI := bsClient.addBlob(t, dataContents)
+	mainOutputs := []*bespb.File{{Name: "bin", File: &bespb.File_Uri{Uri: binURI}}}
+	runfiles := []*bespb.Runfile{
+		{File: &bespb.File{Name: "bin", File: &bespb.File_Uri{Uri: binURI}}, IsExecutable: true},
+		{File: &bespb.File{Name: "data", File: &bespb.File_Uri{Uri: dataURI}}},
+	}
+	env := envWithByteStreamClient(bsClient)
+	outputBaseDir := t.TempDir()
+	binPath := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, "bin")
+	dataPath := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, "data")
+
+	_, err := downloadOutputs(context.Background(), env, mainOutputs, runfiles, nil, outputBaseDir)
+	require.NoError(t, err)
+	// The executable is both a main output and a runfile: fetched once, kept executable.
+	require.Equal(t, 2, bsClient.readCount())
+	info, err := os.Stat(binPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0755), info.Mode().Perm())
+
+	downloaded, err := downloadOutputs(context.Background(), env, mainOutputs, runfiles, nil, outputBaseDir)
+	require.NoError(t, err)
+	require.Equal(t, 2, bsClient.readCount(), "second run should not re-fetch unchanged files")
+	require.Contains(t, downloaded, filepath.Clean(binPath))
+	require.Contains(t, downloaded, filepath.Clean(dataPath))
+
+	// Same size, different bytes: only the hash tells this file is stale.
+	require.NoError(t, os.WriteFile(dataPath, bytes.Repeat([]byte("DATA"), 100), 0644))
+	require.NoError(t, os.Chmod(binPath, 0644))
+	_, err = downloadOutputs(context.Background(), env, mainOutputs, runfiles, nil, outputBaseDir)
+	require.NoError(t, err)
+	require.Equal(t, 3, bsClient.readCount())
+	got, err := os.ReadFile(dataPath)
+	require.NoError(t, err)
+	require.Equal(t, dataContents, got)
+	info, err = os.Stat(binPath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0755), info.Mode().Perm(), "a skipped file still gets its expected mode")
+}
+
+func TestDownloadOutputs_WrapsDownloadErrors(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	missing := newFakeByteStreamClient().addBlob(t, []byte("never stored"))
+	runfiles := []*bespb.Runfile{{File: &bespb.File{Name: "gone", File: &bespb.File_Uri{Uri: missing}}}}
+
+	_, err := downloadOutputs(context.Background(), envWithByteStreamClient(bsClient), nil, runfiles, nil, t.TempDir())
+
+	require.ErrorContains(t, err, `download runfile "gone": download output "gone"`)
 }
