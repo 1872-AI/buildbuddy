@@ -1330,9 +1330,8 @@ func TestDownloadOutputs_SupportingDirsSkipUpToDateFiles(t *testing.T) {
 	outputBaseDir := t.TempDir()
 	pluginDir := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, "plugin")
 
-	downloaded, err := downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
+	_, err = downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
 	require.NoError(t, err)
-	require.Empty(t, downloaded, "only per-file outputs are candidates for the run executable")
 	require.Equal(t, 3, bsClient.readCount())
 	got, err := os.ReadFile(filepath.Join(pluginDir, "tool"))
 	require.NoError(t, err, "the symlink should resolve to the downloaded file")

@@ -57,7 +57,8 @@ import (
 )
 
 const (
-	BuildBuddyArtifactDir = "bb-out"
+	BuildBuddyArtifactDir  = "bb-out"
+	maxConcurrentDownloads = 32
 
 	escapeSeq                         = "\u001B["
 	gitConfigSection                  = "buildbuddy"
@@ -88,7 +89,6 @@ var (
 	timeout                 = RemoteFlagset.Duration("timeout", 0, "If set, requests that have exceeded this timeout will be canceled automatically. (Ex. --timeout=15m; --timeout=2h)")
 	execPropsFlag           = bbflag.New(RemoteFlagset, "runner_exec_properties", []string{}, "Exec properties that will apply to the *ci runner execution*. Key-value pairs should be separated by '=' (Ex. --runner_exec_properties=NAME=VALUE). Can be specified more than once. NOTE: If you want to apply an exec property to the bazel command that's run on the runner, just pass at the end of the command (Ex. bb remote build //... --remote_default_exec_properties=OSFamily=linux).")
 	remoteHeaders           = bbflag.New(RemoteFlagset, "remote_run_header", []string{}, "Remote headers to be applied to the execution request for the remote run. Can be used to set platform properties containing secrets (Ex. --remote_run_header=x-buildbuddy-platform.SECRET_NAME=SECRET_VALUE). Can be specified more than once.")
-	downloadConcurrency     = RemoteFlagset.Int("download_concurrency", 32, "For `run` commands with --run_remotely=false, the maximum number of outputs and runfiles downloaded at once.")
 	runRemotely             = RemoteFlagset.Bool("run_remotely", true, "For `run` commands, whether the target should be run remotely. If false, the target will be built remotely, and then fetched and run locally.")
 	useSystemGitCredentials = RemoteFlagset.Bool("use_system_git_credentials", false, "Whether to use github auth pre-configured on the remote runner. If false, require https and an access token for git access.")
 	runFromBranch           = RemoteFlagset.String("run_from_branch", "", "A GitHub branch to base the remote run off. If unset, the remote workspace will mirror your local workspace.")
@@ -839,11 +839,10 @@ func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceN
 		}
 		return nil
 	}
-	// os.Create would write through a symlink a previous run left here.
-	if info, err := os.Lstat(outFile); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		if err := os.Remove(outFile); err != nil {
-			return fmt.Errorf("remove stale symlink %q: %w", outFile, err)
-		}
+	// Replace rather than truncate: os.Create would write through a symlink
+	// a previous run left here, and fails on an executable that is still running.
+	if err := os.Remove(outFile); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale output file %q: %w", outFile, err)
 	}
 	out, err := os.Create(outFile)
 	if err != nil {
@@ -877,9 +876,6 @@ func localFileMatchesDigest(outFile string, resourceName *digest.CASResourceName
 // replaceSymlink points newName at target,
 // replacing whatever a previous run left at that path.
 func replaceSymlink(target, newName string) error {
-	if existing, err := os.Readlink(newName); err == nil && existing == target {
-		return nil
-	}
 	if err := os.RemoveAll(newName); err != nil {
 		return fmt.Errorf("remove stale %q: %w", newName, err)
 	}
@@ -933,23 +929,20 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	bsClient := env.GetByteStreamClient()
 
 	type pendingDownload struct {
-		name         string
 		resourceName *digest.CASResourceName
 		mode         os.FileMode
-		// Says which list the file came from, e.g. `download runfile "x"`.
-		errorPrefix string
+		// Prefixes a failure, e.g. `download runfile "x": download output "x"`.
+		errorLabel string
 	}
 	// Keyed by local path: the run executable is usually both a main output
 	// and a runfile, and two concurrent writers to one path would corrupt it.
 	downloads := make(map[string]*pendingDownload)
-	var downloadOrder []string
-	queueDownload := func(outFile, name string, r *digest.CASResourceName, mode os.FileMode, errorPrefix string) {
+	queueDownload := func(outFile string, r *digest.CASResourceName, mode os.FileMode, errorLabel string) {
 		if existing, ok := downloads[outFile]; ok {
 			existing.mode |= mode
 			return
 		}
-		downloads[outFile] = &pendingDownload{name: name, resourceName: r, mode: mode, errorPrefix: errorPrefix}
-		downloadOrder = append(downloadOrder, outFile)
+		downloads[outFile] = &pendingDownload{resourceName: r, mode: mode, errorLabel: errorLabel}
 	}
 	addDownload := func(f *bespb.File, mode os.FileMode, errorPrefix string) (string, error) {
 		r, err := bytestreamURIToResourceName(f.GetUri())
@@ -961,7 +954,7 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 			outFile = filepath.Join(outFile, p)
 		}
 		outFile = filepath.Clean(filepath.Join(outFile, f.GetName()))
-		queueDownload(outFile, f.GetName(), r, mode, fmt.Sprintf("%s %q", errorPrefix, f.GetName()))
+		queueDownload(outFile, r, mode, fmt.Sprintf("%s %q: download output %q", errorPrefix, f.GetName(), f.GetName()))
 		return outFile, nil
 	}
 
@@ -983,9 +976,6 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 			return nil, err
 		}
 	}
-	// Only the run executable's lookup reads downloadedFiles,
-	// so tree-artifact contents stay out of it.
-	perFileDownloads := len(downloads)
 	// Tree artifacts go through the same pool rather than dirtools.DownloadTree,
 	// which re-fetches every file on every run.
 	for _, d := range supportingDirs {
@@ -1017,7 +1007,7 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 					mode = 0755
 				}
 				r := digest.NewCASResourceName(fileNode.GetDigest(), rn.GetInstanceName(), rn.GetDigestFunction())
-				queueDownload(filepath.Join(outDir, fileNode.GetName()), fileNode.GetName(), r, mode, errorPrefix)
+				queueDownload(filepath.Join(outDir, fileNode.GetName()), r, mode, fmt.Sprintf("%s: download output %q", errorPrefix, fileNode.GetName()))
 			}
 			for _, symlinkNode := range dir.GetSymlinks() {
 				if err := replaceSymlink(symlinkNode.GetTarget(), filepath.Join(outDir, symlinkNode.GetName())); err != nil {
@@ -1037,13 +1027,12 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	}
 
 	eg, egCtx := errgroup.WithContext(ctx)
-	eg.SetLimit(max(1, *downloadConcurrency))
-	for _, outFile := range downloadOrder {
-		d := downloads[outFile]
+	eg.SetLimit(maxConcurrentDownloads)
+	for outFile, d := range downloads {
 		eg.Go(func() error {
-			log.Debugf("Downloading output %q to %q with mode %s", d.name, outFile, d.mode)
+			log.Debugf("Downloading %q with mode %s", outFile, d.mode)
 			if err := downloadFile(egCtx, bsClient, d.resourceName, outFile, d.mode); err != nil {
-				return fmt.Errorf("%s: download output %q: %w", d.errorPrefix, d.name, err)
+				return fmt.Errorf("%s: %w", d.errorLabel, err)
 			}
 			return nil
 		})
@@ -1051,8 +1040,8 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
-	downloadedFiles := make(map[string]struct{}, perFileDownloads)
-	for _, outFile := range downloadOrder[:perFileDownloads] {
+	downloadedFiles := make(map[string]struct{}, len(downloads))
+	for outFile := range downloads {
 		downloadedFiles[outFile] = struct{}{}
 	}
 
