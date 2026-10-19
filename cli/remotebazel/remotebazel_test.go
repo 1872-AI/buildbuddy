@@ -1136,17 +1136,19 @@ func runPrintLogsWithCapturedStdout(t *testing.T, client bbspb.BuildBuddyService
 }
 
 // fakeByteStreamClient serves blobs by hash, counting reads.
-// If readBarrier is set, each Read blocks until that many reads are in flight at once.
+// If readBarrier is set, each Read blocks until that many reads have been in flight at once.
 type fakeByteStreamClient struct {
 	bspb.ByteStreamClient
 
 	blobs map[string][]byte
 
-	mu          sync.Mutex
-	reads       int
-	inFlight    int
-	readBarrier int
-	allInFlight chan struct{}
+	mu              sync.Mutex
+	reads           int
+	inFlight        int
+	maxInFlight     int
+	readBarrier     int
+	allInFlight     chan struct{}
+	allInFlightOnce sync.Once
 }
 
 func newFakeByteStreamClient() *fakeByteStreamClient {
@@ -1169,8 +1171,9 @@ func (c *fakeByteStreamClient) Read(ctx context.Context, req *bspb.ReadRequest, 
 	c.mu.Lock()
 	c.reads++
 	c.inFlight++
+	c.maxInFlight = max(c.maxInFlight, c.inFlight)
 	if c.inFlight == c.readBarrier {
-		close(c.allInFlight)
+		c.allInFlightOnce.Do(func() { close(c.allInFlight) })
 	}
 	c.mu.Unlock()
 	defer func() {
@@ -1193,6 +1196,12 @@ func (c *fakeByteStreamClient) Read(ctx context.Context, req *bspb.ReadRequest, 
 		data = compression.CompressZstd(nil, data)
 	}
 	return &fakeReadStream{data: data}, nil
+}
+
+func (c *fakeByteStreamClient) maxConcurrentReads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxInFlight
 }
 
 func (c *fakeByteStreamClient) readCount() int {
@@ -1224,14 +1233,15 @@ func envWithByteStreamClient(bsClient bspb.ByteStreamClient) environment.Env {
 
 func TestDownloadOutputs_DownloadsConcurrently(t *testing.T) {
 	bsClient := newFakeByteStreamClient()
+	fileCount := maxConcurrentDownloads + 8
 	var runfiles []*bespb.Runfile
-	for i := range 4 {
-		uri := bsClient.addBlob(t, bytes.Repeat([]byte{byte('a' + i)}, 200))
+	for i := range fileCount {
+		uri := bsClient.addBlob(t, bytes.Repeat([]byte(fmt.Sprintf("file%d,", i)), 50))
 		runfiles = append(runfiles, &bespb.Runfile{File: &bespb.File{Name: fmt.Sprintf("file%d", i), File: &bespb.File_Uri{Uri: uri}}})
 	}
-	// A serial downloader never gets more than one read in flight,
-	// so it blocks here until the context deadline instead of passing.
-	bsClient.readBarrier = len(runfiles)
+	// A downloader with fewer than maxConcurrentDownloads reads in flight
+	// blocks here until the context deadline instead of passing.
+	bsClient.readBarrier = maxConcurrentDownloads
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	outputBaseDir := t.TempDir()
@@ -1239,11 +1249,12 @@ func TestDownloadOutputs_DownloadsConcurrently(t *testing.T) {
 	downloaded, err := downloadOutputs(ctx, envWithByteStreamClient(bsClient), nil, runfiles, nil, outputBaseDir)
 
 	require.NoError(t, err)
-	require.Len(t, downloaded, len(runfiles))
-	for i := range 4 {
+	require.Len(t, downloaded, fileCount)
+	require.Equal(t, maxConcurrentDownloads, bsClient.maxConcurrentReads(), "downloads must stay within the limit")
+	for i := range fileCount {
 		got, err := os.ReadFile(filepath.Join(outputBaseDir, BuildBuddyArtifactDir, fmt.Sprintf("file%d", i)))
 		require.NoError(t, err)
-		require.Equal(t, bytes.Repeat([]byte{byte('a' + i)}, 200), got)
+		require.Equal(t, bytes.Repeat([]byte(fmt.Sprintf("file%d,", i)), 50), got)
 	}
 }
 
@@ -1314,11 +1325,19 @@ func TestDownloadOutputs_SupportingDirsSkipUpToDateFiles(t *testing.T) {
 	binDir := &repb.Directory{Files: []*repb.FileNode{{Name: "tool", Digest: toolDigest, IsExecutable: true}}}
 	binDirDigest, err := digest.ComputeForMessage(binDir, repb.DigestFunction_SHA256)
 	require.NoError(t, err)
+	emptyDirDigest, err := digest.ComputeForMessage(&repb.Directory{}, repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	outsideDir := t.TempDir()
 	tree := &repb.Tree{
 		Root: &repb.Directory{
-			Files:       []*repb.FileNode{{Name: "README", Digest: readmeDigest}},
-			Directories: []*repb.DirectoryNode{{Name: "bin", Digest: binDirDigest}},
-			Symlinks:    []*repb.SymlinkNode{{Name: "tool", Target: "bin/tool"}},
+			Files: []*repb.FileNode{{Name: "README", Digest: readmeDigest}},
+			// "empty" is deliberately absent from Children.
+			Directories: []*repb.DirectoryNode{{Name: "bin", Digest: binDirDigest}, {Name: "empty", Digest: emptyDirDigest}},
+			Symlinks: []*repb.SymlinkNode{
+				{Name: "tool", Target: "bin/tool"},
+				{Name: "self", Target: ""},
+				{Name: "outside", Target: outsideDir},
+			},
 		},
 		Children: []*repb.Directory{binDir},
 	}
@@ -1326,21 +1345,48 @@ func TestDownloadOutputs_SupportingDirsSkipUpToDateFiles(t *testing.T) {
 	require.NoError(t, err)
 	treeURI := bsClient.addBlob(t, treeBytes)
 	supportingDirs := []*bespb.Tree{{Name: "plugin", Uri: treeURI}}
+	// Both collide with the tree, which is fetched last and so wins.
+	runfiles := []*bespb.Runfile{
+		{File: &bespb.File{Name: "plugin/README", File: &bespb.File_Uri{Uri: bsClient.addBlob(t, []byte("stale readme"))}}},
+		{File: &bespb.File{Name: "plugin/outside/config", File: &bespb.File_Uri{Uri: bsClient.addBlob(t, []byte("config"))}}},
+	}
 	env := envWithByteStreamClient(bsClient)
 	outputBaseDir := t.TempDir()
 	pluginDir := filepath.Join(outputBaseDir, BuildBuddyArtifactDir, "plugin")
 
-	_, err = downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
+	_, err = downloadOutputs(context.Background(), env, nil, runfiles, supportingDirs, outputBaseDir)
 	require.NoError(t, err)
-	require.Equal(t, 3, bsClient.readCount())
-	got, err := os.ReadFile(filepath.Join(pluginDir, "tool"))
+	require.Equal(t, 4, bsClient.readCount())
+	got, err := os.ReadFile(filepath.Join(pluginDir, "README"))
+	require.NoError(t, err)
+	require.Equal(t, readmeContents, got)
+	require.NoFileExists(t, filepath.Join(outsideDir, "config"), "no download may write through a tree symlink")
+	selfTarget, err := os.Readlink(filepath.Join(pluginDir, "self"))
+	require.NoError(t, err)
+	require.Equal(t, ".", selfTarget)
+	require.DirExists(t, filepath.Join(pluginDir, "empty"))
+	got, err = os.ReadFile(filepath.Join(pluginDir, "tool"))
 	require.NoError(t, err, "the symlink should resolve to the downloaded file")
 	require.Equal(t, toolContents, got)
 	info, err := os.Stat(filepath.Join(pluginDir, "bin", "tool"))
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0755), info.Mode().Perm())
 
-	_, err = downloadOutputs(context.Background(), env, nil, nil, supportingDirs, outputBaseDir)
+	_, err = downloadOutputs(context.Background(), env, nil, runfiles, supportingDirs, outputBaseDir)
 	require.NoError(t, err)
-	require.Equal(t, 4, bsClient.readCount(), "second run should fetch only the tree metadata")
+	require.Equal(t, 6, bsClient.readCount(), "second run should fetch only the tree metadata and the overwritten runfile")
+}
+
+func TestDownloadOutputs_SupportingDirMissingChildIsMissingDigest(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	missingDirDigest, err := digest.ComputeForMessage(&repb.Directory{Files: []*repb.FileNode{{Name: "x"}}}, repb.DigestFunction_SHA256)
+	require.NoError(t, err)
+	treeBytes, err := proto.Marshal(&repb.Tree{Root: &repb.Directory{Directories: []*repb.DirectoryNode{{Name: "sub", Digest: missingDirDigest}}}})
+	require.NoError(t, err)
+	supportingDirs := []*bespb.Tree{{Name: "plugin", Uri: bsClient.addBlob(t, treeBytes)}}
+
+	_, err = downloadOutputs(context.Background(), envWithByteStreamClient(bsClient), nil, nil, supportingDirs, t.TempDir())
+
+	require.ErrorContains(t, err, `download supporting output dir "plugin"`)
+	require.True(t, status.IsFailedPreconditionError(err), "callers detect missing CAS entries by status: %s", err)
 }

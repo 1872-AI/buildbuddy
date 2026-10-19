@@ -876,6 +876,10 @@ func localFileMatchesDigest(outFile string, resourceName *digest.CASResourceName
 // replaceSymlink points newName at target,
 // replacing whatever a previous run left at that path.
 func replaceSymlink(target, newName string) error {
+	// Bazel encodes a link to "." as an empty target, which Linux rejects.
+	if target == "" {
+		target = "."
+	}
 	if err := os.RemoveAll(newName); err != nil {
 		return fmt.Errorf("remove stale %q: %w", newName, err)
 	}
@@ -936,9 +940,10 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	}
 	// Keyed by local path: the run executable is usually both a main output
 	// and a runfile, and two concurrent writers to one path would corrupt it.
+	// Different contents for one path keep the last, as writing serially would.
 	downloads := make(map[string]*pendingDownload)
 	queueDownload := func(outFile string, r *digest.CASResourceName, mode os.FileMode, errorLabel string) {
-		if existing, ok := downloads[outFile]; ok {
+		if existing, ok := downloads[outFile]; ok && existing.resourceName.GetDigest().GetHash() == r.GetDigest().GetHash() {
 			existing.mode |= mode
 			return
 		}
@@ -978,6 +983,12 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	}
 	// Tree artifacts go through the same pool rather than dirtools.DownloadTree,
 	// which re-fetches every file on every run.
+	// Their symlinks are created after the downloads,
+	// so no download writes through one.
+	type pendingSymlink struct {
+		target, path, errorPrefix string
+	}
+	var symlinks []pendingSymlink
 	for _, d := range supportingDirs {
 		rn, err := bytestreamURIToResourceName(d.GetUri())
 		if err != nil {
@@ -994,12 +1005,16 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 		errorPrefix := fmt.Sprintf("download supporting output dir %q", d.GetName())
 		var queueDir func(dirDigest *repb.Digest, outDir string) error
 		queueDir = func(dirDigest *repb.Digest, outDir string) error {
-			dir, ok := dirMap[digest.NewKey(dirDigest)]
-			if !ok {
-				return fmt.Errorf("%s: directory %q is missing from its tree", errorPrefix, outDir)
-			}
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("%s: create dir %q: %w", errorPrefix, outDir, err)
+			}
+			// Bazel may leave an empty directory out of Tree.Children.
+			if digest.IsEmptyHash(dirDigest, rn.GetDigestFunction()) && dirDigest.GetSizeBytes() == 0 {
+				return nil
+			}
+			dir, ok := dirMap[digest.NewKey(dirDigest)]
+			if !ok {
+				return fmt.Errorf("%s: directory %q: %w", errorPrefix, outDir, digest.MissingDigestError(dirDigest))
 			}
 			for _, fileNode := range dir.GetFiles() {
 				mode := os.FileMode(0644)
@@ -1010,9 +1025,7 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 				queueDownload(filepath.Join(outDir, fileNode.GetName()), r, mode, fmt.Sprintf("%s: download output %q", errorPrefix, fileNode.GetName()))
 			}
 			for _, symlinkNode := range dir.GetSymlinks() {
-				if err := replaceSymlink(symlinkNode.GetTarget(), filepath.Join(outDir, symlinkNode.GetName())); err != nil {
-					return fmt.Errorf("%s: %w", errorPrefix, err)
-				}
+				symlinks = append(symlinks, pendingSymlink{symlinkNode.GetTarget(), filepath.Join(outDir, symlinkNode.GetName()), errorPrefix})
 			}
 			for _, dirNode := range dir.GetDirectories() {
 				if err := queueDir(dirNode.GetDigest(), filepath.Join(outDir, dirNode.GetName())); err != nil {
@@ -1030,6 +1043,10 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	eg.SetLimit(maxConcurrentDownloads)
 	for outFile, d := range downloads {
 		eg.Go(func() error {
+			// Once one download fails, don't replace files that haven't started.
+			if err := egCtx.Err(); err != nil {
+				return err
+			}
 			log.Debugf("Downloading %q with mode %s", outFile, d.mode)
 			if err := downloadFile(egCtx, bsClient, d.resourceName, outFile, d.mode); err != nil {
 				return fmt.Errorf("%s: %w", d.errorLabel, err)
@@ -1039,6 +1056,11 @@ func downloadOutputs(ctx context.Context, env environment.Env, mainOutputs []*be
 	}
 	if err := eg.Wait(); err != nil {
 		return nil, err
+	}
+	for _, link := range symlinks {
+		if err := replaceSymlink(link.target, link.path); err != nil {
+			return nil, fmt.Errorf("%s: %w", link.errorPrefix, err)
+		}
 	}
 	downloadedFiles := make(map[string]struct{}, len(downloads))
 	for outFile := range downloads {
