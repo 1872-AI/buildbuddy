@@ -1149,10 +1149,14 @@ type fakeByteStreamClient struct {
 	readBarrier     int
 	allInFlight     chan struct{}
 	allInFlightOnce sync.Once
+	// If set, each Read sends half its blob, signals stalled, and blocks until canceled.
+	stallMidStream bool
+	stalled        chan struct{}
+	stalledOnce    sync.Once
 }
 
 func newFakeByteStreamClient() *fakeByteStreamClient {
-	return &fakeByteStreamClient{blobs: map[string][]byte{}, allInFlight: make(chan struct{})}
+	return &fakeByteStreamClient{blobs: map[string][]byte{}, allInFlight: make(chan struct{}), stalled: make(chan struct{})}
 }
 
 // addBlob stores data and returns the bytestream URI the BES would report for it.
@@ -1195,6 +1199,9 @@ func (c *fakeByteStreamClient) Read(ctx context.Context, req *bspb.ReadRequest, 
 	if rn.GetCompressor() == repb.Compressor_ZSTD {
 		data = compression.CompressZstd(nil, data)
 	}
+	if c.stallMidStream {
+		return &fakeReadStream{data: data[:len(data)/2], stallCtx: ctx, onStall: func() { c.stalledOnce.Do(func() { close(c.stalled) }) }}, nil
+	}
 	return &fakeReadStream{data: data}, nil
 }
 
@@ -1215,9 +1222,17 @@ type fakeReadStream struct {
 
 	data []byte
 	sent bool
+	// If set, the stream blocks after data until stallCtx is done.
+	stallCtx context.Context
+	onStall  func()
 }
 
 func (s *fakeReadStream) Recv() (*bspb.ReadResponse, error) {
+	if s.sent && s.stallCtx != nil {
+		s.onStall()
+		<-s.stallCtx.Done()
+		return nil, s.stallCtx.Err()
+	}
 	if s.sent {
 		return nil, io.EOF
 	}
@@ -1389,4 +1404,41 @@ func TestDownloadOutputs_SupportingDirMissingChildIsMissingDigest(t *testing.T) 
 
 	require.ErrorContains(t, err, `download supporting output dir "plugin"`)
 	require.True(t, status.IsFailedPreconditionError(err), "callers detect missing CAS entries by status: %s", err)
+}
+
+func TestDownloadOutputs_InterruptKeepsPreviousFiles(t *testing.T) {
+	bsClient := newFakeByteStreamClient()
+	bsClient.stallMidStream = true
+	// Under 100 bytes, so the fake serves it uncompressed and the half it sends is written as-is.
+	newContents := bytes.Repeat([]byte("new"), 30)
+	runfiles := []*bespb.Runfile{{File: &bespb.File{Name: "tool", File: &bespb.File_Uri{Uri: bsClient.addBlob(t, newContents)}}, IsExecutable: true}}
+	outputBaseDir := t.TempDir()
+	outDir := filepath.Join(outputBaseDir, BuildBuddyArtifactDir)
+	require.NoError(t, os.MkdirAll(outDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(outDir, "tool"), []byte("previous build"), 0755))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-bsClient.stalled
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := downloadOutputs(ctx, envWithByteStreamClient(bsClient), nil, runfiles, nil, outputBaseDir)
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("downloadOutputs did not return after its context was canceled")
+	}
+
+	require.ErrorContains(t, err, "context canceled")
+	got, err := os.ReadFile(filepath.Join(outDir, "tool"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("previous build"), got, "an interrupted download must not replace the previous file")
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "no partial download may be left behind: %v", entries)
 }

@@ -839,21 +839,26 @@ func downloadFile(ctx context.Context, bsClient bspb.ByteStreamClient, resourceN
 		}
 		return nil
 	}
-	// Replace rather than truncate: os.Create would write through a symlink
-	// a previous run left here, and fails on an executable that is still running.
-	if err := os.Remove(outFile); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale output file %q: %w", outFile, err)
-	}
-	out, err := os.Create(outFile)
+	// Write beside outFile and rename over it, as Bazel does:
+	// an interrupted download leaves the previous file intact rather than a partial one,
+	// and a symlink or still-running executable at outFile is replaced, not written through.
+	out, err := os.CreateTemp(filepath.Dir(outFile), "."+filepath.Base(outFile)+".bb-download-*")
 	if err != nil {
 		return fmt.Errorf("create output file %q: %w", outFile, err)
 	}
+	defer os.Remove(out.Name())
 	defer out.Close()
 	if err := cachetools.GetBlob(ctx, bsClient, resourceName, out); err != nil {
 		return status.WrapError(err, "download blob")
 	}
 	if err := out.Chmod(mode); err != nil {
 		return fmt.Errorf("set permissions on output file %q: %w", outFile, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("write output file %q: %w", outFile, err)
+	}
+	if err := os.Rename(out.Name(), outFile); err != nil {
+		return fmt.Errorf("move output file into place at %q: %w", outFile, err)
 	}
 	return nil
 }
