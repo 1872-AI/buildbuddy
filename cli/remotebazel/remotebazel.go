@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -75,6 +76,11 @@ const (
 	gitRemoteRegex = `(.+)\s+(.+)\s+\((push|fetch)\)`
 
 	maxRetries = 5
+
+	// How long to keep showing a cancelled remote run's logs while it shuts
+	// down: the executor's max termination grace period (1m by default),
+	// plus the lease renewal that delivers the cancel.
+	remoteCancelStreamTimeout = 90 * time.Second
 )
 
 var (
@@ -1363,30 +1369,61 @@ func attemptRun(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, exe
 
 	// If the remote bazel process is canceled or killed, cancel the remote run
 	isInvocationRunning := true
-	defer func() {
-		if !isInvocationRunning {
-			return
-		}
-
-		// Use a non-cancelled context to ensure the remote executions are
-		// canceled
-		_, err = bbClient.CancelExecutions(context.WithoutCancel(ctx), &inpb.CancelExecutionsRequest{
-			InvocationId: iid,
+	var cancelOnce sync.Once
+	cancelRemoteRun := func() {
+		cancelOnce.Do(func() {
+			// Use a non-cancelled context to ensure the remote executions are
+			// canceled
+			_, err := bbClient.CancelExecutions(context.WithoutCancel(ctx), &inpb.CancelExecutionsRequest{
+				InvocationId: iid,
+			})
+			if err != nil {
+				log.Warnf("Failed to cancel remote run: %s", err)
+			}
 		})
-		if err != nil {
-			log.Warnf("Failed to cancel remote run: %s", err)
+	}
+	defer func() {
+		if isInvocationRunning {
+			cancelRemoteRun()
 		}
 	}()
 
+	// Keep streaming logs after an interrupt, so the output of the run's
+	// shutdown within its termination grace period is still shown.
+	streamCtx, stopStreaming := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopStreaming()
+	go func() {
+		select {
+		case <-streamCtx.Done():
+			return
+		case <-ctx.Done():
+		}
+		secondInterrupt := make(chan os.Signal, 1)
+		signal.Notify(secondInterrupt, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(secondInterrupt)
+		log.Printf("Cancelling the remote run and showing its output until it stops. Interrupt again to exit now.")
+		cancelRemoteRun()
+		select {
+		case <-streamCtx.Done():
+			return
+		case <-secondInterrupt:
+		case <-time.After(remoteCancelStreamTimeout):
+		}
+		stopStreaming()
+	}()
+
 	interactive := terminal.IsTTY(os.Stdin) && terminal.IsTTY(os.Stderr)
+	var streamErr error
 	if interactive {
-		if err := streamLogs(ctx, bbClient, iid); err != nil {
-			return nil, nil, status.WrapError(err, "streaming logs")
-		}
+		streamErr = streamLogs(streamCtx, bbClient, iid)
 	} else {
-		if err := printLogs(ctx, bbClient, iid); err != nil {
-			return nil, nil, status.WrapError(err, "streaming logs")
-		}
+		streamErr = printLogs(streamCtx, bbClient, iid)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, status.WrapError(err, "remote run interrupted")
+	}
+	if streamErr != nil {
+		return nil, nil, status.WrapError(streamErr, "streaming logs")
 	}
 	isInvocationRunning = false
 

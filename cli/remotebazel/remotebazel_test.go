@@ -30,6 +30,8 @@ import (
 	bespb "github.com/buildbuddy-io/buildbuddy/proto/build_event_stream"
 	bbspb "github.com/buildbuddy-io/buildbuddy/proto/buildbuddy_service"
 	elpb "github.com/buildbuddy-io/buildbuddy/proto/eventlog"
+	inpb "github.com/buildbuddy-io/buildbuddy/proto/invocation"
+	rnpb "github.com/buildbuddy-io/buildbuddy/proto/runner"
 )
 
 func init() {
@@ -570,6 +572,59 @@ func TestPrintLogs_ReturnsStreamError(t *testing.T) {
 
 	require.True(t, status.IsNotFoundError(err), "expected NotFound, got: %v", err)
 	require.Equal(t, "Analyzing: 1\n", out)
+}
+
+// cancellableRunClient is a scriptedBuildBuddyClient that also starts a run
+// and records cancellations.
+type cancellableRunClient struct {
+	*scriptedBuildBuddyClient
+
+	cancelCount int
+}
+
+func (c *cancellableRunClient) Run(ctx context.Context, req *rnpb.RunRequest, opts ...grpc.CallOption) (*rnpb.RunResponse, error) {
+	return &rnpb.RunResponse{InvocationId: "test-invocation-id"}, nil
+}
+
+func (c *cancellableRunClient) CancelExecutions(ctx context.Context, req *inpb.CancelExecutionsRequest, opts ...grpc.CallOption) (*inpb.CancelExecutionsResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cancelCount++
+	return &inpb.CancelExecutionsResponse{}, nil
+}
+
+func TestAttemptRun_InterruptKeepsShowingShutdownLogs(t *testing.T) {
+	ctx, interrupt := context.WithCancel(t.Context())
+	client := &cancellableRunClient{scriptedBuildBuddyClient: &scriptedBuildBuddyClient{
+		script: []scriptedRecv{
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer:      []byte("Deploying.\n"),
+				NextChunkId: "0001",
+			}},
+			// The user interrupts while the run is in progress.
+			{hook: interrupt, rsp: &elpb.GetEventLogChunkResponse{
+				Buffer:      []byte("Rolling back.\n"),
+				NextChunkId: "0002",
+			}},
+			{rsp: &elpb.GetEventLogChunkResponse{
+				Buffer: []byte("Rolled back.\n"),
+			}},
+		},
+	}}
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	oldStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	_, _, runErr := attemptRun(ctx, client, nil /*=execClient*/, &rnpb.RunRequest{})
+
+	require.NoError(t, w.Close())
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.ErrorIs(t, runErr, context.Canceled)
+	require.Equal(t, "Deploying.\nRolling back.\nRolled back.\n", string(out))
+	require.Equal(t, 1, client.cancelCount)
 }
 
 func TestGitConfig_BranchAndSha(t *testing.T) {
