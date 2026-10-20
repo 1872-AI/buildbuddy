@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -557,6 +558,10 @@ type ociContainer struct {
 	cdiRegistry *cdi.Cache
 
 	seccompProfile *specs.LinuxSeccomp
+
+	// execPIDFiles holds the crun --pid-file path of each in-flight Exec.
+	execPIDFilesMu sync.Mutex
+	execPIDFiles   map[string]struct{}
 }
 
 // Assert [*ociContainer] implements [container.StatsRecorder].
@@ -829,7 +834,12 @@ func (c *ociContainer) Exec(ctx context.Context, cmd *repb.Command, stdio *inter
 	for _, e := range commandEnv {
 		args = append(args, fmt.Sprintf("--env=%s=%s", e.GetName(), e.GetValue()))
 	}
-	args = append(args, c.cid)
+	pidFile, untrack, err := c.trackExecPIDFile()
+	if err != nil {
+		return commandutil.ErrorResult(status.UnavailableErrorf("track exec pid file: %s", err))
+	}
+	defer untrack()
+	args = append(args, "--pid-file="+pidFile, c.cid)
 
 	// If this Exec() is running a long-lived persistent worker, then don't
 	// start the stats polling loop. Instead, the caller is responsible for
@@ -855,7 +865,117 @@ func (c *ociContainer) Signal(ctx context.Context, sig syscall.Signal) error {
 	if c.cid == "" {
 		return status.FailedPreconditionError("container is not created")
 	}
-	return c.invokeRuntimeSimple(ctx, "kill", "--all", c.cid, fmt.Sprintf("%d", sig))
+	execPIDs := c.execPIDs()
+	if len(execPIDs) == 0 {
+		// The command is the container's init process (Run), or an Exec
+		// whose pid crun has not written yet.
+		// Init ignores signals it has no handler for, so signal everything.
+		return c.invokeRuntimeSimple(ctx, "kill", "--all", c.cid, fmt.Sprintf("%d", sig))
+	}
+	// Signal only the exec'd command's process group, like a terminal's
+	// Ctrl-C, rather than every process in the container.
+	// `kill --all` would also stop the container's init,
+	// and hit processes the command put in their own session,
+	// which the command may already relay the signal to itself.
+	for _, pid := range execPIDs {
+		if err := c.signalProcessGroup(pid, sig); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// containerPIDs returns the host pids of every process in the container's
+// cgroup tree.
+func (c *ociContainer) containerPIDs() ([]int, error) {
+	var pids []int
+	err := filepath.WalkDir(c.cgroupPath(), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "cgroup.procs" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for field := range strings.FieldsSeq(string(b)) {
+			if pid, err := strconv.Atoi(field); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+		return nil
+	})
+	return pids, err
+}
+
+func (c *ociContainer) trackExecPIDFile() (pidFile string, untrack func(), err error) {
+	id, err := newCID()
+	if err != nil {
+		return "", nil, err
+	}
+	pidFile = filepath.Join(c.bundlePath(), "exec-"+id+".pid")
+	c.execPIDFilesMu.Lock()
+	defer c.execPIDFilesMu.Unlock()
+	if c.execPIDFiles == nil {
+		c.execPIDFiles = map[string]struct{}{}
+	}
+	c.execPIDFiles[pidFile] = struct{}{}
+	return pidFile, func() {
+		c.execPIDFilesMu.Lock()
+		defer c.execPIDFilesMu.Unlock()
+		delete(c.execPIDFiles, pidFile)
+		_ = os.Remove(pidFile)
+	}, nil
+}
+
+// execPIDs returns the host pids of the in-flight Exec commands that crun
+// has started.
+func (c *ociContainer) execPIDs() []int {
+	c.execPIDFilesMu.Lock()
+	defer c.execPIDFilesMu.Unlock()
+	var pids []int
+	for pidFile := range c.execPIDFiles {
+		b, err := os.ReadFile(pidFile)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+// signalProcessGroup signals every process in the container's cgroup that
+// shares pid's process group.
+// The exec'd command may not lead its process group,
+// and the group can also hold the host-side crun process,
+// so this filters by cgroup rather than signalling -pgid.
+func (c *ociContainer) signalProcessGroup(pid int, sig syscall.Signal) error {
+	pgid, err := unix.Getpgid(pid)
+	if err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return nil
+		}
+		return status.UnavailableErrorf("get process group of %d: %s", pid, err)
+	}
+	containerPIDs, err := c.containerPIDs()
+	if err != nil {
+		return status.UnavailableErrorf("list container processes: %s", err)
+	}
+	for _, procPID := range containerPIDs {
+		if procPGID, err := unix.Getpgid(procPID); err != nil || procPGID != pgid {
+			continue
+		}
+		if err := unix.Kill(procPID, sig); err != nil && !errors.Is(err, unix.ESRCH) {
+			return status.UnavailableErrorf("signal %d: %s", procPID, err)
+		}
+	}
+	return nil
 }
 
 func (c *ociContainer) Pause(ctx context.Context) error {

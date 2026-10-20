@@ -1127,6 +1127,70 @@ func TestSignal(t *testing.T) {
 	assert.Empty(t, string(res.Stderr))
 }
 
+func TestSignal_Exec(t *testing.T) {
+	setupNetworking(t)
+
+	image := busyboxImage(t)
+
+	ctx := context.Background()
+	env := testenv.GetTestEnv(t)
+	installLeaserInEnv(t, env)
+	installFileCacheInEnv(t, env)
+
+	runtimeRoot := testfs.MakeTempDir(t)
+	flags.Set(t, "executor.oci.runtime_root", runtimeRoot)
+
+	buildRoot := testfs.MakeTempDir(t)
+	cacheRoot := testfs.MakeTempDir(t)
+
+	provider, err := ociruntime.NewProvider(env, buildRoot, cacheRoot)
+	require.NoError(t, err)
+	wd := testfs.MakeDirAll(t, buildRoot, "work")
+
+	c, err := provider.New(ctx, &container.Init{Props: &platform.Properties{
+		ContainerImage: image,
+	}})
+	require.NoError(t, err)
+	err = c.PullImage(ctx, oci.Credentials{})
+	require.NoError(t, err)
+	err = c.Create(ctx, wd)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := c.Remove(ctx)
+		require.NoError(t, err)
+	})
+
+	// The background process is in its own session, like the pty session
+	// ci_runner runs bazel in. It must not be signalled directly.
+	cmd := &repb.Command{Arguments: []string{"sh", "-c", `
+		setsid sh -c 'trap "touch .BACKGROUND_SIGNALED; exit 1" TERM; touch .BACKGROUND_STARTED; while true; do sleep 0.1; done' &
+		trap 'echo "Got SIGTERM"; exit 1' TERM
+		until [ -e .BACKGROUND_STARTED ]; do sleep 0.1; done
+		touch .STARTED
+		while true; do sleep 0.1; done
+	`}}
+
+	go func() {
+		err := disk.WaitUntilExists(ctx, filepath.Join(wd, ".STARTED"), disk.WaitOpts{Timeout: -1})
+		require.NoError(t, err)
+		err = c.Signal(ctx, syscall.SIGTERM)
+		require.NoError(t, err)
+	}()
+
+	res := c.Exec(ctx, cmd, &interfaces.Stdio{})
+	assert.NoError(t, res.Error)
+	assert.Equal(t, 1, res.ExitCode)
+	assert.Equal(t, "Got SIGTERM\n", string(res.Stdout))
+
+	time.Sleep(500 * time.Millisecond)
+	assert.NoFileExists(t, filepath.Join(wd, ".BACKGROUND_SIGNALED"))
+
+	// The container's init must survive, so the runner stays usable.
+	res = c.Exec(ctx, &repb.Command{Arguments: []string{"echo", "alive"}}, &interfaces.Stdio{})
+	require.NoError(t, res.Error)
+	assert.Equal(t, "alive\n", string(res.Stdout))
+}
+
 func TestNetworking(t *testing.T) {
 	setupNetworking(t)
 
