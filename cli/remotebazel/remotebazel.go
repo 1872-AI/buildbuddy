@@ -60,6 +60,8 @@ const (
 	BuildBuddyArtifactDir  = "bb-out"
 	maxConcurrentDownloads = 32
 
+	bazelExitCodeInterrupted = 8
+
 	escapeSeq                         = "\u001B["
 	gitConfigSection                  = "buildbuddy"
 	gitConfigRemoteBazelRemote        = "remote-bazel-remote-name"
@@ -1458,19 +1460,24 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 				execArgs := defaultRunArgs
 				// Pass through extra arguments (-- --foo=bar) from the command line.
 				execArgs = append(execArgs, opts.ExecArgs...)
+				// Registered before the ctx check, so a SIGTERM from here on is queued for the binary.
+				termSignals := make(chan os.Signal, 1)
+				signal.Notify(termSignals, syscall.SIGTERM)
+				defer signal.Stop(termSignals)
+				if err := ctx.Err(); err != nil {
+					return 1, err
+				}
 				log.Printf("Running downloaded executable %q locally (working directory %q)", absBinPath, runfilesWorkDir)
-				cmd := exec.CommandContext(ctx, absBinPath, execArgs...)
+				cmd := exec.Command(absBinPath, execArgs...)
 				cmd.Dir = runfilesWorkDir
 				cmd.Env = envForLocalRun(os.Environ(), runfilesDir, opts.AbsLocalWorkspaceDir, opts.AbsLocalWorkingDirectory)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
-				err = cmd.Run()
-				if e, ok := err.(*exec.ExitError); ok {
-					return e.ExitCode(), nil
-				} else if err != nil {
+				exitCode, err := runLocalExecutable(cmd, termSignals)
+				if err != nil {
 					return 1, fmt.Errorf("run local output %q: %w", binPath, err)
 				}
-				return 0, nil
+				return exitCode, nil
 			}
 		} else {
 			log.Warnf("Cannot download outputs - no child invocations found")
@@ -1478,6 +1485,35 @@ func Run(ctx context.Context, opts RunOpts, repoConfig *RepoConfig) (int, error)
 	}
 
 	return exitCode, nil
+}
+
+// runLocalExecutable leaves Ctrl-C to the binary, as `bazel run` does by exec'ing it:
+// the terminal already delivers SIGINT to the whole foreground process group.
+// A SIGTERM sent to bb alone would not reach the binary, so it arrives on forward and is relayed.
+func runLocalExecutable(cmd *exec.Cmd, forward <-chan os.Signal) (int, error) {
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	for {
+		select {
+		case sig := <-forward:
+			cmd.Process.Signal(sig)
+		case err := <-done:
+			if e, ok := err.(*exec.ExitError); ok {
+				// A shell reports 130 for a Ctrl-C'd `bazel run`; ExitCode() would be -1.
+				if ws, ok := e.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+					return 128 + int(ws.Signal()), nil
+				}
+				return e.ExitCode(), nil
+			}
+			if err != nil {
+				return 1, err
+			}
+			return 0, nil
+		}
+	}
 }
 
 func attemptRun(ctx context.Context, bbClient bbspb.BuildBuddyServiceClient, execClient repb.ExecutionClient, req *rnpb.RunRequest) (*inpb.GetInvocationResponse, *repb.ExecuteResponse, error) {
@@ -1690,7 +1726,7 @@ func HandleRemoteBazel(commandLineArgs []string) (int, error) {
 	}
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-buildbuddy-api-key", apiKey)
 
-	exitCode, err := Run(ctx, RunOpts{
+	return reportInterrupt(Run(ctx, RunOpts{
 		Server:                   runner,
 		Name:                     remoteRunName,
 		Command:                  cmd,
@@ -1700,9 +1736,15 @@ func HandleRemoteBazel(commandLineArgs []string) (int, error) {
 		FetchOutputs:             fetchOutputs,
 		AbsLocalWorkspaceDir:     filepath.Dir(wsFilePath),
 		AbsLocalWorkingDirectory: localWorkingDirectory,
-	}, repoConfig)
+	}, repoConfig))
+}
+
+// reportInterrupt reports a Ctrl-C during the remote run or the output download the way Bazel does:
+// exit code 8 and a one-line notice on stderr instead of the cancellation error.
+func reportInterrupt(exitCode int, err error) (int, error) {
 	if err != nil && strings.Contains(err.Error(), "context canceled") {
-		return exitCode, nil
+		log.Print("bb remote interrupted")
+		return bazelExitCodeInterrupted, nil
 	}
 	return exitCode, err
 }

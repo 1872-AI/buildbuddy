@@ -7,9 +7,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1441,4 +1443,71 @@ func TestDownloadOutputs_InterruptKeepsPreviousFiles(t *testing.T) {
 	entries, err := os.ReadDir(outDir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "no partial download may be left behind: %v", entries)
+}
+
+// runTrappingChild runs a binary that cleans up and exits 42 on sig,
+// sends it sig once its trap is installed, and returns its exit code and output.
+func runTrappingChild(t *testing.T, sig string, send func(cmd *exec.Cmd, forward chan<- os.Signal)) (int, string) {
+	script := fmt.Sprintf(`trap 'kill $sleeper; echo cleaned up; exit 42' %s; sleep 30 & sleeper=$!; echo ready; wait`, sig)
+	cmd := exec.Command("/usr/bin/env", "bash", "-c", script)
+	stdout := lockingbuffer.New()
+	cmd.Stdout = stdout
+	forward := make(chan os.Signal, 1)
+	exitCode := make(chan int, 1)
+	go func() {
+		code, err := runLocalExecutable(cmd, forward)
+		assert.NoError(t, err)
+		exitCode <- code
+	}()
+	require.Eventually(t, func() bool { return strings.Contains(stdout.String(), "ready") }, 10*time.Second, 10*time.Millisecond)
+	send(cmd, forward)
+	select {
+	case code := <-exitCode:
+		return code, stdout.String()
+	case <-time.After(10 * time.Second):
+		t.Fatal("local executable did not exit after the signal")
+		return 0, ""
+	}
+}
+
+func TestRunLocalExecutable_ChildHandlesCtrlC(t *testing.T) {
+	// Ctrl-C reaches the binary through the terminal's process group, not through bb.
+	code, stdout := runTrappingChild(t, "INT", func(cmd *exec.Cmd, _ chan<- os.Signal) {
+		require.NoError(t, cmd.Process.Signal(syscall.SIGINT))
+	})
+	require.Equal(t, 42, code, "a Ctrl-C'd binary's own exit code must be propagated")
+	require.Contains(t, stdout, "cleaned up", "the binary must get to run its SIGINT handler")
+}
+
+func TestRunLocalExecutable_ForwardsSIGTERM(t *testing.T) {
+	code, stdout := runTrappingChild(t, "TERM", func(_ *exec.Cmd, forward chan<- os.Signal) {
+		forward <- syscall.SIGTERM
+	})
+	require.Equal(t, 42, code, "a SIGTERM sent to bb alone must reach the binary")
+	require.Contains(t, stdout, "cleaned up")
+}
+
+func TestRunLocalExecutable_ExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		script string
+		want   int
+	}{
+		{script: "exit 3", want: 3},
+		// Matches what a shell reports after a Ctrl-C'd `bazel run`, rather than -1.
+		{script: "kill -INT $$", want: 130},
+	} {
+		code, err := runLocalExecutable(exec.Command("/usr/bin/env", "bash", "-c", tc.script), nil)
+		require.NoError(t, err)
+		require.Equal(t, tc.want, code, tc.script)
+	}
+}
+
+func TestReportInterrupt(t *testing.T) {
+	code, err := reportInterrupt(1, fmt.Errorf("download invocation outputs: %w", context.Canceled))
+	require.NoError(t, err, "an interrupt is reported by exit code, not as an error")
+	require.Equal(t, 8, code, "an interrupted bb remote must exit like an interrupted bazel")
+
+	code, err = reportInterrupt(42, nil)
+	require.NoError(t, err)
+	require.Equal(t, 42, code, "a finished run keeps its own exit code, even if Ctrl-C reached the local binary")
 }
