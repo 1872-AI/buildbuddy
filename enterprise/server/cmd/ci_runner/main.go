@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
@@ -713,6 +714,7 @@ func run() error {
 	if isBazelWrapper {
 		return runBazelWrapper()
 	}
+	interrupts.forwardFrom(syscall.SIGINT, syscall.SIGTERM)
 
 	runID, err := newUUID()
 	if err != nil {
@@ -1210,6 +1212,9 @@ func (ar *actionRunner) Run(ctx context.Context, ws *workspace) error {
 	}
 
 	for i, step := range action.Steps {
+		if interrupts.isInterrupted() {
+			return status.AbortedError("interrupted")
+		}
 		cmdStartTime := time.Now()
 
 		// The UI uses TargetConfigured/Completed build events to render artifacts
@@ -2852,6 +2857,8 @@ func runCommand(ctx context.Context, executable string, args []string, env map[s
 			return startErr
 		}
 		defer f.Close()
+		interrupts.commandStarted(cmd.Process.Pid)
+		defer interrupts.commandExited()
 		copyOutputDone := make(chan struct{})
 		go func() {
 			io.Copy(outputSink, f)
@@ -2873,6 +2880,62 @@ func runCommand(ctx context.Context, executable string, args []string, env map[s
 	}
 
 	return err
+}
+
+// interrupts relays a SIGINT or SIGTERM received by the ci_runner,
+// such as the executor's graceful termination of a cancelled task,
+// to the running command as SIGINT.
+// Commands run in their own pty session, so they never see the ci_runner's
+// signals otherwise, and get SIGKILLed when the executor's grace period ends.
+// SIGINT is what Bazel treats as a user cancel,
+// and what it passes on to a `bazel run` target.
+var interrupts = &interruptForwarder{}
+
+type interruptForwarder struct {
+	mu sync.Mutex
+	// pgid is the process group of the running command, or 0 if none is
+	// running.
+	pgid        int
+	interrupted bool
+}
+
+func (f *interruptForwarder) forwardFrom(signals ...os.Signal) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, signals...)
+	go func() {
+		for range ch {
+			f.interrupt()
+		}
+	}()
+}
+
+func (f *interruptForwarder) interrupt() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.interrupted = true
+	if f.pgid != 0 {
+		_ = syscall.Kill(-f.pgid, syscall.SIGINT)
+	}
+}
+
+// commandStarted records the command's process group.
+// pty.Start makes the command a session leader, so its pid is its pgid.
+func (f *interruptForwarder) commandStarted(pid int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pgid = pid
+}
+
+func (f *interruptForwarder) commandExited() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pgid = 0
+}
+
+func (f *interruptForwarder) isInterrupted() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.interrupted
 }
 
 func timeoutExceededMessage() string {

@@ -765,6 +765,11 @@ type FirecrackerContainer struct {
 	latestGuestStatsMu sync.Mutex
 	latestGuestStats   *repb.UsageStats
 
+	// activeExecClient is the guest exec client of the in-flight
+	// ExecStreamed call, if any, so that Signal can reach the command.
+	activeExecClientMu sync.Mutex
+	activeExecClient   vmxpb.ExecClient
+
 	useOCIFetcher bool
 
 	// postCompletionStats accumulates firecracker snapshot save stats
@@ -2460,6 +2465,8 @@ func (c *FirecrackerContainer) sendExecRequestToGuest(ctx context.Context, conn 
 
 	client := vmxpb.NewExecClient(conn)
 	health := hlpb.NewHealthClient(conn)
+	c.setActiveExecClient(client)
+	defer c.setActiveExecClient(nil)
 
 	resultCh := make(chan *interfaces.CommandResult, 1)
 	healthCheckErrCh := make(chan error, 1)
@@ -2924,10 +2931,23 @@ func (c *FirecrackerContainer) resetGuestState(ctx context.Context, result *inte
 	return nil
 }
 
+func (c *FirecrackerContainer) setActiveExecClient(client vmxpb.ExecClient) {
+	c.activeExecClientMu.Lock()
+	defer c.activeExecClientMu.Unlock()
+	c.activeExecClient = client
+}
+
 func (c *FirecrackerContainer) Signal(ctx context.Context, sig syscall.Signal) error {
-	// TODO: forward the signal as a message on any currently running vmexec
-	// stream.
-	return status.UnimplementedError("not implemented")
+	c.activeExecClientMu.Lock()
+	client := c.activeExecClient
+	c.activeExecClientMu.Unlock()
+	if client == nil {
+		return status.FailedPreconditionError("no command is running in the VM")
+	}
+	// A guest booted from a snapshot taken before vmexec supported Signal
+	// returns Unimplemented; the caller then falls back to force-killing.
+	_, err := client.Signal(ctx, &vmxpb.SignalRequest{Signal: int32(sig)})
+	return err
 }
 
 func (c *FirecrackerContainer) IsImageCached(ctx context.Context) (bool, error) {

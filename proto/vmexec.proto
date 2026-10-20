@@ -32,6 +32,10 @@ service Exec {
 
   // Mounts the workspace drive.
   rpc MountWorkspace(MountWorkspaceRequest) returns (MountWorkspaceResponse);
+
+  // Sends a signal to the process group of every command currently running
+  // via ExecStreamed.
+  rpc Signal(SignalRequest) returns (SignalResponse);
 }
 
 message ExecRequest {
@@ -157,6 +161,13 @@ message InitializeRequest {
 message InitializeResponse {
   // This page intentionally left empty.
 }
+
+message SignalRequest {
+  // The signal number, e.g. 2 for SIGINT or 15 for SIGTERM.
+  int32 signal = 1;
+}
+
+message SignalResponse {}
 
 message SyncRequest {}
 message SyncResponse {}

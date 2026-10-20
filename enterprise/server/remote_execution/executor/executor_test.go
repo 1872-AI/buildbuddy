@@ -734,6 +734,69 @@ func TestExecuteTaskAndStreamResults_MissingInput(t *testing.T) {
 	}
 }
 
+func TestExecuteTaskAndStreamResults_CancelledTaskExitsWithinGracePeriod(t *testing.T) {
+	ctx := t.Context()
+	task := getTask()
+	task.GetExecutionTask().GetCommand().Platform = &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: platform.TerminationGracePeriodPropertyName, Value: (30 * time.Second).String()},
+		},
+	}
+	taskCtx, cancelTask := context.WithCancel(ctx)
+	runCtxAliveAfterCancel := false
+	runOverride := func(runCtx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		cancelTask()
+		time.Sleep(100 * time.Millisecond)
+		runCtxAliveAfterCancel = runCtx.Err() == nil
+		// Simulate the command handling the termination signal and exiting.
+		return &interfaces.CommandResult{ExitCode: 130}
+	}
+	exec, _, execClient, mockServer, mockCounter := getExecutor(t, runOverride)
+	publisher, err := operation.Publish(ctx, execClient, task.GetExecutionTask().GetExecutionId())
+	require.NoError(t, err)
+
+	_, err = exec.ExecuteTaskAndStreamResults(taskCtx, task, publisher)
+	require.NoError(t, err)
+
+	require.True(t, runCtxAliveAfterCancel, "command should keep running during the grace period")
+	<-mockServer.finished
+	require.Equal(t, 0, mockCounter.countFinishedCleanly)
+	ops := mockServer.getOperations()
+	completedOp := ops[len(ops)-1]
+	unpackedCompletedOp, err := rexec.UnpackOperation(completedOp)
+	require.NoError(t, err)
+	require.Equal(t, int32(codes.Aborted), unpackedCompletedOp.ExecuteResponse.GetStatus().GetCode())
+}
+
+func TestExecuteTaskAndStreamResults_CancelledTaskForceKilledAfterGracePeriod(t *testing.T) {
+	ctx := t.Context()
+	task := getTask()
+	gracePeriod := 200 * time.Millisecond
+	task.GetExecutionTask().GetCommand().Platform = &repb.Platform{
+		Properties: []*repb.Platform_Property{
+			{Name: platform.TerminationGracePeriodPropertyName, Value: gracePeriod.String()},
+		},
+	}
+	taskCtx, cancelTask := context.WithCancel(ctx)
+	var timeToForceKill time.Duration
+	runOverride := func(runCtx context.Context, original rbetest.RunFunc) *interfaces.CommandResult {
+		cancelledAt := time.Now()
+		cancelTask()
+		// Simulate a command that ignores the termination signal.
+		<-runCtx.Done()
+		timeToForceKill = time.Since(cancelledAt)
+		return &interfaces.CommandResult{ExitCode: commandutil.KilledExitCode, Error: status.CanceledError("killed")}
+	}
+	exec, _, execClient, _, _ := getExecutor(t, runOverride)
+	publisher, err := operation.Publish(ctx, execClient, task.GetExecutionTask().GetExecutionId())
+	require.NoError(t, err)
+
+	_, err = exec.ExecuteTaskAndStreamResults(taskCtx, task, publisher)
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, timeToForceKill, gracePeriod)
+}
+
 func TestExecuteTaskAndStreamResults_Timeout(t *testing.T) {
 	tests := []struct {
 		name            string

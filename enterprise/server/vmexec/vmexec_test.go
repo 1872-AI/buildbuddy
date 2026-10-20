@@ -7,6 +7,7 @@ import (
 	"net"
 	"path"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -184,6 +185,41 @@ func TestExecStreamed_Crash(t *testing.T) {
 	assert.Equal(t, "foo-stdout\n", string(res.Stdout), "should get partial stdout despite crash")
 	assert.Equal(t, "bar-stderr\n", string(res.Stderr), "should get partial stderr despite crash")
 	assert.Equal(t, commandutil.KilledExitCode, res.ExitCode)
+}
+
+func TestSignal_ReachesRunningCommand(t *testing.T) {
+	client := startExecService(t)
+	workDir := testfs.MakeTempDir(t)
+	cmd := &repb.Command{
+		Arguments: []string{"bash", "-c", `
+			trap 'echo got-sigint; exit 3' INT
+			touch trap-installed
+			while true; do sleep 0.05; done
+		`},
+	}
+	resCh := make(chan *interfaces.CommandResult, 1)
+	go func() {
+		resCh <- vmexec_client.Execute(context.Background(), client, cmd, workDir, "" /*=user*/, nil /*=statsListener*/, nil /*=stdio*/)
+	}()
+	require.Eventually(t, func() bool {
+		return testfs.Exists(t, workDir, "trap-installed")
+	}, 10*time.Second, 10*time.Millisecond)
+
+	_, err := client.Signal(context.Background(), &vmxpb.SignalRequest{Signal: int32(syscall.SIGINT)})
+	require.NoError(t, err)
+
+	res := <-resCh
+	require.NoError(t, res.Error)
+	assert.Equal(t, 3, res.ExitCode)
+	assert.Equal(t, "got-sigint\n", string(res.Stdout))
+}
+
+func TestSignal_NoRunningCommand(t *testing.T) {
+	client := startExecService(t)
+
+	_, err := client.Signal(context.Background(), &vmxpb.SignalRequest{Signal: int32(syscall.SIGINT)})
+
+	assert.True(t, status.IsFailedPreconditionError(err), "expected FailedPrecondition but got %v", err)
 }
 
 func startExecService(t *testing.T) vmxpb.ExecClient {

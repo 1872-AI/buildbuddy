@@ -438,9 +438,11 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 	log.CtxDebugf(ctx, "Executing task.")
 	stage.Set("execution")
 	_ = stream.SetState(repb.ExecutionProgress_EXECUTING_COMMAND)
+	runCtx, cancelRun := withCancellationGrace(ctx, execTimeouts.ForceKillAfter-execTimeouts.TerminateAfter, r.GracefulTerminate)
+	defer cancelRun()
 	cmdResultChan := make(chan *interfaces.CommandResult, 1)
 	go func() {
-		cmdResultChan <- r.Run(ctx, md.IoStats)
+		cmdResultChan <- r.Run(runCtx, md.IoStats)
 	}()
 
 	// Run a timer that periodically sends update messages back
@@ -480,6 +482,10 @@ func (s *Executor) ExecuteTaskAndStreamResults(ctx context.Context, st *repb.Sch
 	// Make sure we return an error in this case.
 	if cmdResult.ExitCode < 0 {
 		cmdResult.Error = incompleteExecutionError(ctx, cmdResult.ExitCode, cmdResult.Error)
+	} else if ctx.Err() != nil {
+		// The command exited within its cancellation grace period, but the
+		// task itself was still cancelled.
+		cmdResult.Error = incompleteExecutionError(ctx, cmdResult.ExitCode, status.AbortedError("task cancelled"))
 	}
 	// If the command was terminated gracefully, make sure we return a
 	// DeadlineExceeded error.
@@ -644,6 +650,50 @@ func (m *ActionMetrics) Report(ctx context.Context) {
 		metrics.FileUploadSizeBytes.Observe(float64(md.IoStats.FileUploadSizeBytes))
 		metrics.FileUploadDurationUsec.Observe(float64(md.IoStats.FileUploadDurationUsec))
 	}
+}
+
+// withCancellationGrace returns the context to run a task's command in.
+// When ctx is cancelled before its deadline (the client cancelled the task,
+// or its lease was lost), the command is asked to terminate and gets
+// gracePeriod to exit before the returned context is cancelled, which
+// force-kills it.
+// A command that is SIGKILLed mid-way through an external side effect,
+// like a deploy, leaves that side effect half-applied.
+func withCancellationGrace(ctx context.Context, gracePeriod time.Duration, terminate func(context.Context) error) (context.Context, context.CancelFunc) {
+	if gracePeriod <= 0 {
+		return context.WithCancel(ctx)
+	}
+	// The run context keeps ctx's deadline, so a task that hits its force-kill
+	// deadline is still stopped right away.
+	var runCtx context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := ctx.Deadline(); ok {
+		runCtx, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	} else {
+		runCtx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+	}
+	go func() {
+		select {
+		case <-runCtx.Done():
+			return
+		case <-ctx.Done():
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			return
+		}
+		log.CtxInfof(ctx, "Task cancelled; sending graceful termination signal")
+		if err := terminate(runCtx); err != nil {
+			log.CtxWarningf(ctx, "Failed to send graceful termination signal: %s", err)
+			cancel()
+			return
+		}
+		select {
+		case <-runCtx.Done():
+		case <-time.After(gracePeriod):
+			cancel()
+		}
+	}()
+	return runCtx, cancel
 }
 
 func incompleteExecutionError(ctx context.Context, exitCode int, err error) error {

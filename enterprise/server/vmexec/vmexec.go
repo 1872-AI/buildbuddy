@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -90,13 +91,47 @@ type execServer struct {
 
 	// metrics holds metrics about this VM, and is returned from every Exec.
 	metrics *vmxpb.Metrics
+
+	mu sync.Mutex
+	// running holds the commands started via ExecStreamed that have not yet
+	// exited, so that Signal can reach them.
+	running map[*command]struct{}
 }
 
 func NewServer(workspaceDevice string) (*execServer, error) {
 	return &execServer{
 		workspaceDevice: workspaceDevice,
 		metrics:         &vmxpb.Metrics{},
+		running:         map[*command]struct{}{},
 	}, nil
+}
+
+func (x *execServer) Signal(ctx context.Context, req *vmxpb.SignalRequest) (*vmxpb.SignalResponse, error) {
+	sig := syscall.Signal(req.GetSignal())
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if len(x.running) == 0 {
+		return nil, status.FailedPreconditionError("no running command to signal")
+	}
+	for cmd := range x.running {
+		select {
+		case cmd.signal <- sig:
+		default:
+			return nil, status.UnavailableErrorf("failed to send signal %q: channel buffer is full", sig)
+		}
+	}
+	return &vmxpb.SignalResponse{}, nil
+}
+
+func (x *execServer) trackRunning(cmd *command) (untrack func()) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.running[cmd] = struct{}{}
+	return func() {
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		delete(x.running, cmd)
+	}
 }
 
 func Run(ctx context.Context, port uint32, workspaceDevice string, initDockerd bool, enableDockerdTCP bool, dnsOverrides []*networking.DNSOverride) error {
@@ -453,8 +488,10 @@ func (x *execServer) ExecStreamed(stream vmxpb.Exec_ExecStreamedServer) error {
 					return
 				}
 				cmdFinished = make(chan struct{})
+				untrack := x.trackRunning(cmd)
 				go func() {
 					defer close(cmdFinished)
+					defer untrack()
 					res, err := cmd.Run(ctx, msgs)
 					if err != nil {
 						msgs <- &message{Err: err}
@@ -495,6 +532,9 @@ func (x *execServer) ExecStreamed(stream vmxpb.Exec_ExecStreamedServer) error {
 
 type command struct {
 	cmd *exec.Cmd
+
+	// signal delivers signals to the command's process group while it runs.
+	signal chan syscall.Signal
 
 	stdin        io.WriteCloser
 	stdoutWriter *io.PipeWriter
@@ -543,6 +583,7 @@ func newCommand(start *vmxpb.ExecRequest) (*command, error) {
 	}
 	return &command{
 		cmd:          cmd,
+		signal:       make(chan syscall.Signal, 8),
 		stdin:        stdin,
 		stdoutReader: stdoutReader,
 		stdoutWriter: stdoutWriter,
@@ -687,7 +728,7 @@ func (c *command) Run(ctx context.Context, msgs chan *message) (*vmxpb.ExecStrea
 	// Using a nil statsListener since we'd rather report stats from the whole
 	// VM (which includes e.g. docker-in-firecracker containers) -- not just the
 	// process being run.
-	_, err := commandutil.RunWithProcessTreeCleanup(ctx, c.cmd, nil /*=statsListener*/)
+	_, err := commandutil.RunWithProcessTreeCleanup(ctx, c.cmd, &commandutil.RunOpts{Signal: c.signal})
 
 	close(commandDone)
 	<-statsDone

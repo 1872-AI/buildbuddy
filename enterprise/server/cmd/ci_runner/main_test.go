@@ -616,3 +616,29 @@ not json at all
 		})
 	}
 }
+
+func TestInterruptForwardsSIGINTToRunningCommand(t *testing.T) {
+	originalInterrupts := interrupts
+	interrupts = &interruptForwarder{}
+	t.Cleanup(func() { interrupts = originalInterrupts })
+	dir := t.TempDir()
+	// The trap runs in a grandchild of the pty session leader, like a
+	// `bazel run` target under the Bazel client.
+	script := `bash -c 'trap "echo got-sigint; exit 3" INT; touch trap-installed; while true; do sleep 0.05; done'`
+	var output bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- runBashCommand(context.Background(), script, nil, dir, &output)
+	}()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dir, "trap-installed"))
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond)
+
+	interrupts.interrupt()
+
+	err := <-runErr
+	assert.Equal(t, 3, getExitCode(err))
+	assert.Contains(t, output.String(), "got-sigint")
+	assert.True(t, interrupts.isInterrupted())
+}
